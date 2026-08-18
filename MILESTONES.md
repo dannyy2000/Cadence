@@ -12,9 +12,10 @@ Contracts:
 - [x] Scaffold from `v4-template` (Foundry), hook compiles and deploys locally
 - [x] Threshold check in `beforeSwap`: below-threshold trades pass straight through as normal swaps
 - [x] Batch queue + deadline: above-threshold trades queue up, `batchDeadline = block.number + N` set on first order in
-- [ ] Primary settlement trigger: next swap after deadline auto-settles the batch
-- [ ] Placeholder clearing rule (naive settlement against reference price) — real CLVR lands in M2
-- [ ] Foundry tests: batch fills, deadline enforces via `block.number`, settlement auto-triggers, orders clear
+- [x] Primary settlement trigger: next swap after deadline auto-settles the batch
+- [x] Fallback settlement trigger: anyone can force settlement once the deadline has passed
+- [x] Placeholder clearing rule (naive sequential settlement, atomic so it can't be externally sandwiched) — real CLVR lands in M2
+- [x] Foundry tests: batch fills, deadline enforces via `block.number`, settlement auto-triggers, orders clear, fallback trigger works, opposing orders both get paid
 
 Frontend:
 - [ ] Minimal read-only scaffold connected to local/testnet pool

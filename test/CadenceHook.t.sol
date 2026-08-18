@@ -182,4 +182,117 @@ contract CadenceHookTest is BaseTest {
         assertEq(int256(swapDelta.amount1()), int256(10e18));
         assertEq(hook.queueLength(poolId), 0);
     }
+
+    function testSettlement_PrimaryTrigger_PaysOutBeneficiary() public {
+        address beneficiary = makeAddr("beneficiary");
+        uint256 amountIn = 10e18;
+
+        // Queue a large order. hookData carries the real beneficiary, since `sender` here
+        // would just be the router.
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(beneficiary),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        assertEq(currency1.balanceOf(beneficiary), 0, "should not be paid before settlement");
+
+        vm.roll(hook.batchDeadline(poolId));
+
+        // Any subsequent swap - even a tiny, unrelated one - settles the overdue batch as a
+        // side effect before its own trade is processed.
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 1e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(hook.queueLength(poolId), 0, "queue should be cleared after settlement");
+        assertEq(hook.batchDeadline(poolId), 0, "deadline should reset after settlement");
+        assertGt(currency1.balanceOf(beneficiary), 0, "beneficiary should have been paid");
+    }
+
+    function testSettlement_FallbackTrigger_AnyoneCanCallAfterDeadline() public {
+        address beneficiary = makeAddr("beneficiary");
+        address rando = makeAddr("rando");
+        uint256 amountIn = 10e18;
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(beneficiary),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(hook.batchDeadline(poolId));
+
+        // A completely uninvolved address can force settlement once the deadline has passed -
+        // the fallback path that bounds worst-case wait time on a quiet pool.
+        vm.prank(rando);
+        hook.settle(poolKey);
+
+        assertEq(hook.queueLength(poolId), 0);
+        assertEq(hook.batchDeadline(poolId), 0);
+        assertGt(currency1.balanceOf(beneficiary), 0);
+    }
+
+    function testSettle_RevertsBeforeDeadline() public {
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.expectRevert(CadenceHook.BatchNotDue.selector);
+        hook.settle(poolKey);
+    }
+
+    function testSettlement_OpposingOrders_BothBeneficiariesPaid() public {
+        address trader0for1 = makeAddr("trader0for1");
+        address trader1for0 = makeAddr("trader1for0");
+        uint256 amountIn = 10e18;
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(trader0for1),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(block.number + 3);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: poolKey,
+            hookData: abi.encode(trader1for0),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(hook.batchDeadline(poolId));
+        hook.settle(poolKey);
+
+        assertGt(currency1.balanceOf(trader0for1), 0, "zeroForOne trader should receive currency1");
+        assertGt(currency0.balanceOf(trader1for0), 0, "oneForZero trader should receive currency0");
+        assertEq(hook.queueLength(poolId), 0);
+    }
 }
