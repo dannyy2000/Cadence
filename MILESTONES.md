@@ -1,0 +1,48 @@
+# Cadence — Milestones
+
+Tracking progress against the UHI10 Hookathon submission schedule.
+
+---
+
+## Milestone 1 — due Sunday, Aug 23 2026
+
+**Goal: prove the batching machinery works end-to-end, not just described.**
+
+Contracts:
+- [ ] Scaffold from `v4-template` (Foundry), hook compiles and deploys locally
+- [ ] Threshold check in `beforeSwap`: below-threshold trades pass straight through as normal swaps
+- [ ] Batch queue + deadline: above-threshold trades queue up, `batchDeadline = block.number + N` set on first order in
+- [ ] Primary settlement trigger: next swap after deadline auto-settles the batch
+- [ ] Placeholder clearing rule (naive settlement against reference price) — real CLVR lands in M2
+- [ ] Foundry tests: batch fills, deadline enforces via `block.number`, settlement auto-triggers, orders clear
+
+Frontend:
+- [ ] Minimal read-only scaffold connected to local/testnet pool
+- [ ] Live view of pool state, batch queue size, blocks remaining until deadline
+
+---
+
+## Milestone 2 — due week two
+
+Contracts:
+- [ ] Real CLVR ordering algorithm replacing the placeholder clearing rule
+- [ ] Fix 1: order-splitting evasion — cumulative price-impact threshold check
+- [ ] Fix 2: one bad order griefing the batch — per-order feasibility check, skip-and-refund
+- [ ] Fix 3: unbounded settlement gas — max batch size, force-settle at cap
+- [ ] Fix 4: reentrancy / pool-key spoofing / double-settlement guards
+- [ ] Fix 5: deterministic CLVR tie-breaking rule
+- [ ] Gas benchmarking on the settlement path
+
+Frontend:
+- [ ] Trade submission form wired to the hook
+- [ ] Live batch visualization (orders joining, deadline countdown, settlement firing)
+- [ ] Wallet connect, deployed to public testnet
+
+---
+
+## Final submission — days after M2
+
+- [ ] Live before/after sandwich demo: identical front-run/victim/back-run sequence against a plain pool vs. a Cadence pool, attacker profit zeroed out — rendered in the frontend
+- [ ] Frontend polish, publicly hosted
+- [ ] Team section + final README pass
+- [ ] Final test/security pass
