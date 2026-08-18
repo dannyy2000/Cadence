@@ -9,7 +9,7 @@ Tracking progress against the UHI10 Hookathon submission schedule.
 **Goal: prove the batching machinery works end-to-end, not just described.**
 
 Contracts:
-- [ ] Scaffold from `v4-template` (Foundry), hook compiles and deploys locally
+- [x] Scaffold from `v4-template` (Foundry), hook compiles and deploys locally
 - [ ] Threshold check in `beforeSwap`: below-threshold trades pass straight through as normal swaps
 - [ ] Batch queue + deadline: above-threshold trades queue up, `batchDeadline = block.number + N` set on first order in
 - [ ] Primary settlement trigger: next swap after deadline auto-settles the batch
