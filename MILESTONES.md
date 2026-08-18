@@ -10,8 +10,8 @@ Tracking progress against the UHI10 Hookathon submission schedule.
 
 Contracts:
 - [x] Scaffold from `v4-template` (Foundry), hook compiles and deploys locally
-- [ ] Threshold check in `beforeSwap`: below-threshold trades pass straight through as normal swaps
-- [ ] Batch queue + deadline: above-threshold trades queue up, `batchDeadline = block.number + N` set on first order in
+- [x] Threshold check in `beforeSwap`: below-threshold trades pass straight through as normal swaps
+- [x] Batch queue + deadline: above-threshold trades queue up, `batchDeadline = block.number + N` set on first order in
 - [ ] Primary settlement trigger: next swap after deadline auto-settles the batch
 - [ ] Placeholder clearing rule (naive settlement against reference price) — real CLVR lands in M2
 - [ ] Foundry tests: batch fills, deadline enforces via `block.number`, settlement auto-triggers, orders clear

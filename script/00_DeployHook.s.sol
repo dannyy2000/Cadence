@@ -6,27 +6,28 @@ import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
 
 import {BaseScript} from "./base/BaseScript.sol";
 
-import {Counter} from "../src/Counter.sol";
+import {CadenceHook} from "../src/CadenceHook.sol";
 
-/// @notice Mines the address and deploys the Counter.sol Hook contract
+/// @notice Mines the address and deploys the CadenceHook contract
 contract DeployHookScript is BaseScript {
+    // Example values for a token pair with 18 decimals — tune per deployment.
+    uint256 constant BATCH_THRESHOLD = 5e18;
+    uint256 constant BATCH_WINDOW_BLOCKS = 10;
+
     function run() public {
         // hook contracts must have specific flags encoded in the address
-        uint160 flags = uint160(
-            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-                | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
-        );
+        uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
 
         // Mine a salt that will produce a hook address with the correct flags
-        bytes memory constructorArgs = abi.encode(poolManager);
+        bytes memory constructorArgs = abi.encode(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS);
         (address hookAddress, bytes32 salt) =
-            HookMiner.find(CREATE2_FACTORY, flags, type(Counter).creationCode, constructorArgs);
+            HookMiner.find(CREATE2_FACTORY, flags, type(CadenceHook).creationCode, constructorArgs);
 
         // Deploy the hook using CREATE2
         vm.startBroadcast();
-        Counter counter = new Counter{salt: salt}(poolManager);
+        CadenceHook cadenceHook = new CadenceHook{salt: salt}(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS);
         vm.stopBroadcast();
 
-        require(address(counter) == hookAddress, "DeployHookScript: Hook Address Mismatch");
+        require(address(cadenceHook) == hookAddress, "DeployHookScript: Hook Address Mismatch");
     }
 }
