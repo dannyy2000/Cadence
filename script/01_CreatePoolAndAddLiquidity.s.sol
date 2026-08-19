@@ -30,6 +30,10 @@ contract CreatePoolAndAddLiquidityScript is BaseScript, LiquidityHelpers {
     /////////////////////////////////////
 
     function run() external {
+        vm.startBroadcast();
+        ensureCurrencies();
+        vm.stopBroadcast();
+
         PoolKey memory poolKey = PoolKey({
             currency0: currency0,
             currency1: currency1,

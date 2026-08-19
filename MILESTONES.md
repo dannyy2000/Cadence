@@ -16,6 +16,8 @@ Contracts:
 - [x] Fallback settlement trigger: anyone can force settlement once the deadline has passed
 - [x] Placeholder clearing rule (naive sequential settlement, atomic so it can't be externally sandwiched) — real CLVR lands in M2
 - [x] Foundry tests: batch fills, deadline enforces via `block.number`, settlement auto-triggers, orders clear, fallback trigger works, opposing orders both get paid
+- [x] Fuzz tests on stable logic (threshold boundary, deadline math, multi-order queueing, settlement payout, opposing orders) — 5 tests × 256 runs
+- [x] Invariant tests on queue/settlement state-machine correctness (queue emptiness ⇔ no deadline; hook custody always matches what's queued) — 2 invariants × 256 runs × 500 calls, via a randomized handler
 
 Frontend:
 - [ ] Minimal read-only scaffold connected to local/testnet pool
@@ -27,6 +29,7 @@ Frontend:
 
 Contracts:
 - [ ] Real CLVR ordering algorithm replacing the placeholder clearing rule
+- [ ] Invariant tests on settlement *pricing* (e.g. no order in a batch deviates from the reference price by more than X) — deferred here since testing this against the M1 placeholder algorithm would be thrown away
 - [ ] Fix 1: order-splitting evasion — cumulative price-impact threshold check
 - [ ] Fix 2: one bad order griefing the batch — per-order feasibility check, skip-and-refund
 - [ ] Fix 3: unbounded settlement gas — max batch size, force-settle at cap

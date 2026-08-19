@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {IERC20} from "forge-std/interfaces/IERC20.sol";
+
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
@@ -35,13 +37,13 @@ contract LiquidityHelpers is BaseScript {
 
     function tokenApprovals() public {
         if (!currency0.isAddressZero()) {
-            token0.approve(address(permit2), type(uint256).max);
-            permit2.approve(address(token0), address(positionManager), type(uint160).max, type(uint48).max);
+            IERC20(Currency.unwrap(currency0)).approve(address(permit2), type(uint256).max);
+            permit2.approve(Currency.unwrap(currency0), address(positionManager), type(uint160).max, type(uint48).max);
         }
 
         if (!currency1.isAddressZero()) {
-            token1.approve(address(permit2), type(uint256).max);
-            permit2.approve(address(token1), address(positionManager), type(uint160).max, type(uint48).max);
+            IERC20(Currency.unwrap(currency1)).approve(address(permit2), type(uint256).max);
+            permit2.approve(Currency.unwrap(currency1), address(positionManager), type(uint160).max, type(uint48).max);
         }
     }
 

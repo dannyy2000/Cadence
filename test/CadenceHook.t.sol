@@ -295,4 +295,150 @@ contract CadenceHookTest is BaseTest {
         assertGt(currency0.balanceOf(trader1for0), 0, "oneForZero trader should receive currency0");
         assertEq(hook.queueLength(poolId), 0);
     }
+
+    // ---------------------------------------------------------------------
+    // Fuzz tests
+    // ---------------------------------------------------------------------
+
+    function testFuzz_ThresholdBoundary(uint256 amountIn) public {
+        amountIn = bound(amountIn, 1e12, 50e18);
+
+        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(int256(swapDelta.amount0()), -int256(amountIn), "input always fully debited either way");
+
+        if (amountIn < BATCH_THRESHOLD) {
+            assertGt(swapDelta.amount1(), 0, "below threshold must execute instantly");
+            assertEq(hook.queueLength(poolId), 0, "below threshold must never touch the queue");
+        } else {
+            assertEq(swapDelta.amount1(), 0, "above threshold must not pay out yet");
+            assertEq(hook.queueLength(poolId), 1, "above threshold must join the queue");
+            assertEq(hook.queuedOrder(poolId, 0).amountIn, amountIn);
+        }
+    }
+
+    function testFuzz_DeadlineSetOnceAndUnchangedByLaterOrders(uint256 firstAmount, uint256 secondAmount, uint256 blocksBeforeSecond)
+        public
+    {
+        firstAmount = bound(firstAmount, BATCH_THRESHOLD, 50e18);
+        secondAmount = bound(secondAmount, BATCH_THRESHOLD, 50e18);
+        blocksBeforeSecond = bound(blocksBeforeSecond, 0, BATCH_WINDOW_BLOCKS - 1);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: firstAmount,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        uint256 expectedDeadline = block.number + BATCH_WINDOW_BLOCKS;
+        assertEq(hook.batchDeadline(poolId), expectedDeadline);
+
+        vm.roll(block.number + blocksBeforeSecond);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: secondAmount,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(hook.batchDeadline(poolId), expectedDeadline, "deadline must not move once a batch is open");
+        assertEq(hook.queueLength(poolId), 2);
+    }
+
+    function testFuzz_MultipleOrdersAccumulateInQueue(uint8 rawCount) public {
+        uint256 count = bound(rawCount, 1, 8);
+        uint256 amountIn = 10e18;
+
+        for (uint256 i = 0; i < count; i++) {
+            swapRouter.swapExactTokensForTokens({
+                amountIn: amountIn,
+                amountOutMin: 0,
+                zeroForOne: i % 2 == 0,
+                poolKey: poolKey,
+                hookData: abi.encode(makeAddr(string.concat("fuzzTrader", vm.toString(i)))),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+        }
+
+        assertEq(hook.queueLength(poolId), count);
+    }
+
+    function testFuzz_Settlement_PaysBeneficiaryRegardlessOfOvershoot(uint256 amountIn, uint256 overshootBlocks)
+        public
+    {
+        amountIn = bound(amountIn, BATCH_THRESHOLD, 50e18);
+        overshootBlocks = bound(overshootBlocks, 0, 500);
+
+        address beneficiary = makeAddr("fuzzBeneficiary");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(beneficiary),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // Settlement must work whether it's triggered right at the deadline or long after -
+        // an overdue batch on a quiet pool is exactly the case the fallback trigger exists for.
+        vm.roll(hook.batchDeadline(poolId) + overshootBlocks);
+        hook.settle(poolKey);
+
+        assertEq(hook.queueLength(poolId), 0);
+        assertEq(hook.batchDeadline(poolId), 0);
+        assertGt(currency1.balanceOf(beneficiary), 0);
+    }
+
+    function testFuzz_OpposingOrders_BothPaidRegardlessOfAmounts(uint256 amount0In, uint256 amount1In) public {
+        amount0In = bound(amount0In, BATCH_THRESHOLD, 50e18);
+        amount1In = bound(amount1In, BATCH_THRESHOLD, 50e18);
+
+        address trader0 = makeAddr("fuzzTrader0");
+        address trader1 = makeAddr("fuzzTrader1");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amount0In,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(trader0),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amount1In,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: poolKey,
+            hookData: abi.encode(trader1),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(hook.batchDeadline(poolId));
+        hook.settle(poolKey);
+
+        assertGt(currency1.balanceOf(trader0), 0, "zeroForOne trader should receive currency1");
+        assertGt(currency0.balanceOf(trader1), 0, "oneForZero trader should receive currency0");
+        assertEq(hook.queueLength(poolId), 0);
+    }
 }
