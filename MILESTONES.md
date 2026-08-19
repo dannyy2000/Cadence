@@ -20,8 +20,8 @@ Contracts:
 - [x] Invariant tests on queue/settlement state-machine correctness (queue emptiness ⇔ no deadline; hook custody always matches what's queued) — 2 invariants × 256 runs × 500 calls, via a randomized handler
 
 Frontend:
-- [ ] Minimal read-only scaffold connected to local/testnet pool
-- [ ] Live view of pool state, batch queue size, blocks remaining until deadline
+- [x] Minimal read-only scaffold connected to local/testnet pool (Vite + React + viem, polling directly via public RPC calls — no wallet connect, no trade submission)
+- [x] Live view of pool state, batch queue size, blocks remaining until deadline — verified against a real local anvil deployment with a live queued order
 
 ---
 
