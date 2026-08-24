@@ -25,6 +25,53 @@ Frontend:
 
 ---
 
+## Local development
+
+Reproduces the exact deployment the M1 frontend dashboard was verified against. Anvil's
+default test accounts are used below — publicly known, local-only, never use them beyond this.
+
+```bash
+# 1. In one terminal: start a local chain
+anvil
+
+# 2. Deploy V4 core infra (PoolManager, PositionManager, Permit2, SwapRouter)
+forge script script/testing/00_DeployV4.s.sol --rpc-url http://127.0.0.1:8545 --broadcast \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+# Note the three addresses it logs (Permit2 is always canonical), then export them so the
+# next scripts reuse this deployment instead of each spinning up their own:
+export POOL_MANAGER_ADDRESS=<V4PoolManager address>
+export POSITION_MANAGER_ADDRESS=<V4PositionManager address>
+export ROUTER_ADDRESS=<V4SwapRouter address>
+
+# 3. Mine and deploy CadenceHook (address must encode its permission flags)
+forge script script/00_DeployHook.s.sol --rpc-url http://127.0.0.1:8545 --broadcast \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+export HOOK_ADDRESS=<CadenceHook address from the broadcast output>
+
+# 4. Deploy two test tokens (CTA/CTB), create the pool, seed it with liquidity
+forge script script/01_CreatePoolAndAddLiquidity.s.sol --rpc-url http://127.0.0.1:8545 --broadcast \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+export CURRENCY0=<lower-sorted token address from the broadcast output>
+export CURRENCY1=<higher-sorted token address from the broadcast output>
+
+# 5. Optional: submit a real swap so there's something to see in the dashboard
+forge script script/03_Swap.s.sol --rpc-url http://127.0.0.1:8545 --broadcast \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+# 6. Point the frontend at this deployment
+cd frontend
+cp .env.example .env.local   # fill in VITE_HOOK_ADDRESS/VITE_CURRENCY0/VITE_CURRENCY1
+npm install
+npm run dev
+```
+
+Steps 3 and 4 must reuse the addresses exported in earlier steps (`POOL_MANAGER_ADDRESS`,
+etc.) — each `forge script` invocation is its own process with no shared state, so without
+those env vars a later script would deploy a second, disconnected set of contracts instead
+of building on the first.
+
+---
+
 ## Milestone 2 — due week two
 
 Contracts:
