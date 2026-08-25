@@ -101,6 +101,104 @@ contract CadenceHookTest is BaseTest {
         assertEq(hook.batchDeadline(poolId), 0);
     }
 
+    function testOrderSplitting_CumulativeVolumeGetsSweptIntoQueue() public {
+        uint256 pieceAmount = 2e18; // below BATCH_THRESHOLD (5e18) on its own
+
+        // First two pieces stay under the cumulative threshold (2e18, then 4e18) - both
+        // execute instantly, exactly like any ordinary small trade.
+        for (uint256 i = 0; i < 2; i++) {
+            BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+                amountIn: pieceAmount,
+                amountOutMin: 0,
+                zeroForOne: true,
+                poolKey: poolKey,
+                hookData: Constants.ZERO_BYTES,
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+            assertGt(swapDelta.amount1(), 0, "piece under cumulative threshold executes instantly");
+        }
+        assertEq(hook.queueLength(poolId), 0);
+
+        // Third piece takes cumulative volume to 6e18, crossing the 5e18 threshold - this
+        // piece (despite being only 2e18 on its own) gets swept into the queue instead.
+        BalanceDelta thirdSwapDelta = swapRouter.swapExactTokensForTokens({
+            amountIn: pieceAmount,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(thirdSwapDelta.amount1(), 0, "crossing piece must not execute instantly");
+        assertEq(hook.queueLength(poolId), 1, "crossing piece must be queued");
+        assertEq(hook.queuedOrder(poolId, 0).amountIn, pieceAmount);
+    }
+
+    function testOrderSplitting_WindowExpiryResetsCumulativeTracking() public {
+        uint256 pieceAmount = 4e18; // below BATCH_THRESHOLD (5e18), but only barely
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: pieceAmount,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // Past the window - the tracked cumulative volume should have expired rather than
+        // carrying forward indefinitely.
+        vm.roll(block.number + BATCH_WINDOW_BLOCKS + 1);
+
+        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+            amountIn: pieceAmount,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // 4e18 + 4e18 = 8e18 would have crossed the threshold if it carried forward - it
+        // executing instantly proves the window reset instead.
+        assertGt(swapDelta.amount1(), 0, "expired window must not carry cumulative volume forward");
+        assertEq(hook.queueLength(poolId), 0);
+    }
+
+    function testOrderSplitting_DirectionsTrackedSeparately() public {
+        uint256 pieceAmount = 4e18;
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: pieceAmount,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // Opposite direction: 4e18 zeroForOne cumulative volume must not count toward this
+        // trade's oneForZero cumulative total.
+        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+            amountIn: pieceAmount,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertGt(swapDelta.amount0(), 0, "opposite direction must not inherit the other direction's cumulative volume");
+        assertEq(hook.queueLength(poolId), 0);
+    }
+
     function testAboveThreshold_JoinsQueueInsteadOfExecuting() public {
         uint256 amountIn = 10e18; // above BATCH_THRESHOLD
         uint256 expectedDeadline = block.number + BATCH_WINDOW_BLOCKS;

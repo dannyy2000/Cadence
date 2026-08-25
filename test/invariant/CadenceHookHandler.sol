@@ -65,16 +65,13 @@ contract CadenceHookHandler is Test {
         uint256 amountIn = bound(amountSeed, 1e14, 50e18);
         address beneficiary = traders[traderSeed % traders.length];
 
-        // A settlement (primary/deadline, or size-cap) can happen at any point during this
-        // call - before this trade's own amount is even considered (deadline overdue), or as
-        // a direct result of this trade's own push (cap reached). Rather than predicting
-        // which trigger fired, compare the real queue length against what it would be if NO
-        // settlement happened at all: any shortfall means something settled, and every ghost
-        // total that existed before this call must be treated as wiped, not just this trade's
-        // own contribution.
+        // Mirror the primary trigger: if the deadline has already passed, the OLD batch
+        // settles as the very first thing the real call does, before this trade's own amount
+        // is even considered.
+        uint256 deadlineBefore = hook.batchDeadline(poolId);
+        bool deadlineTriggered = deadlineBefore != 0 && block.number >= deadlineBefore;
+
         uint256 queueLengthBefore = hook.queueLength(poolId);
-        bool thisOrderAttemptsToQueue = amountIn >= BATCH_THRESHOLD;
-        uint256 expectedIfNoSettlement = queueLengthBefore + (thisOrderAttemptsToQueue ? 1 : 0);
 
         swapRouter.swapExactTokensForTokens({
             amountIn: amountIn,
@@ -88,28 +85,35 @@ contract CadenceHookHandler is Test {
 
         uint256 queueLengthAfter = hook.queueLength(poolId);
 
-        if (queueLengthAfter < expectedIfNoSettlement) {
-            // Something settled during this call - wipe every ghost total that predates it.
+        if (queueLengthAfter == 0) {
+            // Nothing queued afterward - either there was nothing to begin with and this
+            // trade didn't queue either, or a size-cap trigger cleared everything including
+            // this trade (whether or not the deadline was also due first).
             ghost_queued0In = 0;
             ghost_queued1In = 0;
-            // This order still counts if it survived as the start of a fresh batch (settled
-            // an old, overdue batch, then queued itself) rather than also being swept into a
-            // cap-triggered self-settlement (queueLengthAfter == 0 either way).
-            if (queueLengthAfter > 0 && thisOrderAttemptsToQueue) {
-                if (zeroForOne) {
-                    ghost_queued0In += amountIn;
-                } else {
-                    ghost_queued1In += amountIn;
-                }
+        } else if (deadlineTriggered) {
+            // The old batch was wiped (regardless of what it held), and something is queued
+            // afterward - since nothing else can act on an empty queue between that wipe and
+            // this call returning, that something can only be this trade.
+            ghost_queued0In = 0;
+            ghost_queued1In = 0;
+            if (zeroForOne) {
+                ghost_queued0In = amountIn;
+            } else {
+                ghost_queued1In = amountIn;
             }
-        } else if (thisOrderAttemptsToQueue) {
-            // No settlement happened - this order simply joined whatever was already queued.
+        } else if (queueLengthAfter > queueLengthBefore) {
+            // No settlement happened - the queue only grows via this trade's own append,
+            // whether it crossed the per-trade threshold or the cumulative order-splitting
+            // one. A length increase can only be this trade, whichever path caused it.
             if (zeroForOne) {
                 ghost_queued0In += amountIn;
             } else {
                 ghost_queued1In += amountIn;
             }
         }
+        // else: queueLengthAfter <= queueLengthBefore and > 0, deadline wasn't due - this
+        // trade didn't queue (below both thresholds). Ghost unchanged.
     }
 
     function advanceBlocks(uint256 blocksSeed) public {

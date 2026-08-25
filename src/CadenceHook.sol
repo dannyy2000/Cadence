@@ -23,8 +23,7 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "@unisw
 /// one at a time against the AMM curve, then settles the whole batch atomically using the
 /// CLVR ordering rule (McLaughlin, Chemaya, Liu & Malkhi, "CLVR Ordering of Transactions on
 /// AMMs", arXiv:2408.02634) — see `_settle` for the implementation and MILESTONES.md for
-/// what's still simplified relative to the paper (order-splitting resistance, gas-bounded
-/// batch size, etc. — the M2 hardening items, tracked separately from ordering itself).
+/// which security-hardening items are done versus still open.
 contract CadenceHook is BaseHook, IHookEvents {
     using PoolIdLibrary for PoolKey;
     using SafeCast for uint256;
@@ -39,9 +38,7 @@ contract CadenceHook is BaseHook, IHookEvents {
     }
 
     /// @dev Minimum specified input amount (in the input token's own raw units) that routes
-    /// a trade into the batch queue instead of instant execution. A single flat threshold
-    /// is a simplification for now — cumulative price-impact-based thresholding and evasion
-    /// resistance (order-splitting) are M2 hardening work, not implemented here yet.
+    /// a trade into the batch queue instead of instant execution.
     uint256 public immutable batchThreshold;
 
     /// @dev Length of a batch window, in blocks.
@@ -56,6 +53,20 @@ contract CadenceHook is BaseHook, IHookEvents {
 
     /// @dev Queued orders per pool, in arrival order. Cleared on settlement.
     mapping(PoolId => QueuedOrder[]) private _batchQueue;
+
+    struct SmallTradeWindow {
+        uint256 volume;
+        uint256 windowStart;
+    }
+
+    /// @dev Tracks cumulative below-threshold trade volume per pool, per direction, within a
+    /// rolling window (reused as `batchWindowBlocks` long, same as a batch window). Order
+    /// splitting - chopping one large trade into many small ones to dodge the per-trade
+    /// threshold - is a documented real evasion strategy. Without this, an attacker (or
+    /// several colluding addresses) could push arbitrary same-direction volume through with
+    /// zero batching protection. Tracking by direction rather than by address also catches
+    /// splitting across multiple addresses, not just repeated use of one.
+    mapping(PoolId => mapping(bool => SmallTradeWindow)) private _smallTradeWindow;
 
     /// @dev Block number at which the current batch becomes eligible to settle. 0 means no
     /// batch is currently open for that pool.
@@ -146,9 +157,31 @@ contract CadenceHook is BaseHook, IHookEvents {
         uint256 specifiedAmount = uint256(-params.amountSpecified);
 
         if (specifiedAmount < batchThreshold) {
-            // Below threshold: instant execution, identical to a plain Uniswap swap.
-            // No batching, no added latency, no added cost.
-            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+            SmallTradeWindow storage window = _smallTradeWindow[poolId][params.zeroForOne];
+
+            if (window.windowStart == 0 || block.number > window.windowStart + batchWindowBlocks) {
+                // No window open, or the old one expired without crossing the threshold -
+                // start fresh with just this trade.
+                window.windowStart = block.number;
+                window.volume = specifiedAmount;
+            } else {
+                window.volume += specifiedAmount;
+            }
+
+            if (window.volume < batchThreshold) {
+                // Still under the cumulative threshold for this window: instant execution,
+                // identical to a plain Uniswap swap. No batching, no added latency, no added
+                // cost - same as any other below-threshold trade.
+                return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+            }
+
+            // Cumulative same-direction volume just crossed the threshold within this window
+            // - this trade (even though its own size is below the per-trade threshold) is the
+            // one that gets swept into the batch queue, exactly like an ordinary above-
+            // threshold trade would. Earlier pieces of the pattern already executed instantly
+            // before the crossing was detected; this bounds how much total volume can evade
+            // batching per window rather than catching every split piece retroactively.
+            delete _smallTradeWindow[poolId][params.zeroForOne];
         }
 
         Currency specified = params.zeroForOne ? key.currency0 : key.currency1;
