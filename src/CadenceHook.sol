@@ -47,7 +47,14 @@ contract CadenceHook is BaseHook, IHookEvents {
     /// @dev Length of a batch window, in blocks.
     uint256 public immutable batchWindowBlocks;
 
-    /// @dev Queued orders per pool, in arrival order. Cleared on settlement (not yet implemented).
+    /// @dev Maximum number of orders a batch can hold before it force-settles immediately,
+    /// regardless of the deadline. CLVR's selection step is O(n) work per order settled
+    /// (O(n^2) total per batch) - without this cap, nothing stops a batch from growing large
+    /// enough to make settlement's gas cost unpredictable, or from being deliberately grown
+    /// that way as a griefing vector against whoever ends up triggering settlement.
+    uint256 public immutable maxBatchSize;
+
+    /// @dev Queued orders per pool, in arrival order. Cleared on settlement.
     mapping(PoolId => QueuedOrder[]) private _batchQueue;
 
     /// @dev Block number at which the current batch becomes eligible to settle. 0 means no
@@ -77,12 +84,14 @@ contract CadenceHook is BaseHook, IHookEvents {
 
     error BatchNotDue();
 
-    constructor(IPoolManager _poolManager, uint256 _batchThreshold, uint256 _batchWindowBlocks)
+    constructor(IPoolManager _poolManager, uint256 _batchThreshold, uint256 _batchWindowBlocks, uint256 _maxBatchSize)
         BaseHook(_poolManager)
     {
         require(_batchWindowBlocks > 0, "batchWindowBlocks must be > 0");
+        require(_maxBatchSize > 0, "maxBatchSize must be > 0");
         batchThreshold = _batchThreshold;
         batchWindowBlocks = _batchWindowBlocks;
+        maxBatchSize = _maxBatchSize;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -184,9 +193,16 @@ contract CadenceHook is BaseHook, IHookEvents {
             emit HookSwap(PoolId.unwrap(poolId), beneficiary, 0, specifiedAmount.toInt128(), 0, 0);
         }
 
+        if (_batchQueue[poolId].length >= maxBatchSize) {
+            // Size-cap trigger: this order just took the batch to its gas-safety limit, so
+            // it (and everything else queued) settles immediately as a side effect of this
+            // same call, rather than waiting for the deadline.
+            _settle(poolId, key);
+        }
+
         // Net the specified amount to zero so the PoolManager treats this swap's input as
-        // fully handled by the hook. The caller receives no output yet — that only happens
-        // once settlement clears the batch.
+        // fully handled by the hook. The caller receives no output yet unless the size-cap
+        // trigger above just settled it — that only happens once settlement clears the batch.
         return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(specifiedAmount.toInt128(), 0), 0);
     }
 

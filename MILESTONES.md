@@ -79,7 +79,7 @@ Contracts:
 - [ ] Invariant tests on settlement *pricing* (e.g. no order in a batch deviates from the reference price by more than X) — CLVR is in now, so this is unblocked; not yet written
 - [ ] Fix 1: order-splitting evasion — cumulative price-impact threshold check
 - [ ] Fix 2: one bad order griefing the batch — per-order feasibility check, skip-and-refund
-- [ ] Fix 3: unbounded settlement gas — max batch size, force-settle at cap
+- [x] Fix 3: unbounded settlement gas — max batch size (`maxBatchSize`, constructor param), force-settles immediately at the cap rather than waiting for the deadline. Verified by `testMaxBatchSize_ForceSettlesBeforeDeadline`, and now exercised continuously by the invariant handler (which no longer needs to know `maxBatchSize` itself — it detects settlement of any kind by comparing real post-call queue length against what it'd be with no settlement at all, so it stays correct regardless of which trigger fired)
 - [ ] Fix 4: reentrancy / pool-key spoofing / double-settlement guards
 - [ ] Fix 5: deterministic CLVR tie-breaking rule
 - [ ] Gas benchmarking on the settlement path

@@ -29,6 +29,7 @@ contract CadenceHookTest is BaseTest {
 
     uint256 constant BATCH_THRESHOLD = 5e18;
     uint256 constant BATCH_WINDOW_BLOCKS = 10;
+    uint256 constant MAX_BATCH_SIZE = 20;
 
     Currency currency0;
     Currency currency1;
@@ -46,7 +47,7 @@ contract CadenceHookTest is BaseTest {
         address flags = address(
             uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x5555 << 144)
         );
-        bytes memory constructorArgs = abi.encode(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS);
+        bytes memory constructorArgs = abi.encode(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE);
         deployCodeTo("CadenceHook.sol:CadenceHook", constructorArgs, flags);
         hook = CadenceHook(flags);
 
@@ -164,6 +165,53 @@ contract CadenceHookTest is BaseTest {
         CadenceHook.QueuedOrder memory second = hook.queuedOrder(poolId, 1);
         assertFalse(second.zeroForOne);
         assertEq(second.amountIn, amountIn);
+    }
+
+    function testMaxBatchSize_ForceSettlesBeforeDeadline() public {
+        uint256 amountIn = 10e18;
+        address[] memory beneficiaries = new address[](MAX_BATCH_SIZE);
+
+        // Submit MAX_BATCH_SIZE - 1 orders, well before the deadline - queue should just
+        // keep growing, no settlement yet.
+        for (uint256 i = 0; i < MAX_BATCH_SIZE - 1; i++) {
+            beneficiaries[i] = makeAddr(string.concat("capTrader", vm.toString(i)));
+            swapRouter.swapExactTokensForTokens({
+                amountIn: amountIn,
+                amountOutMin: 0,
+                zeroForOne: i % 2 == 0,
+                poolKey: poolKey,
+                hookData: abi.encode(beneficiaries[i]),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+        }
+        assertEq(hook.queueLength(poolId), MAX_BATCH_SIZE - 1);
+        assertLt(block.number, hook.batchDeadline(poolId), "still well before the deadline");
+
+        // The MAX_BATCH_SIZE-th order pushes the queue to its cap - settlement must fire
+        // immediately as a side effect of this same call, not wait for the deadline.
+        beneficiaries[MAX_BATCH_SIZE - 1] = makeAddr("capTraderLast");
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(beneficiaries[MAX_BATCH_SIZE - 1]),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(hook.queueLength(poolId), 0, "batch must force-settle at the size cap");
+        assertEq(hook.batchDeadline(poolId), 0);
+
+        for (uint256 i = 0; i < MAX_BATCH_SIZE; i++) {
+            bool paidInCurrency1 = i % 2 == 0 || i == MAX_BATCH_SIZE - 1;
+            if (paidInCurrency1) {
+                assertGt(currency1.balanceOf(beneficiaries[i]), 0);
+            } else {
+                assertGt(currency0.balanceOf(beneficiaries[i]), 0);
+            }
+        }
     }
 
     function testExactOutputSwap_NotIntercepted() public {
@@ -453,7 +501,7 @@ contract CadenceHookTest is BaseTest {
 
         address flags2 =
             address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x9999 << 144));
-        bytes memory constructorArgs2 = abi.encode(poolManager, uint256(1e18), BATCH_WINDOW_BLOCKS);
+        bytes memory constructorArgs2 = abi.encode(poolManager, uint256(1e18), BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE);
         deployCodeTo("CadenceHook.sol:CadenceHook", constructorArgs2, flags2);
         clvrHook = CadenceHook(flags2);
 

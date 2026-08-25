@@ -30,6 +30,7 @@ contract CadenceHookInvariantTest is BaseTest {
 
     uint256 constant BATCH_THRESHOLD = 5e18;
     uint256 constant BATCH_WINDOW_BLOCKS = 10;
+    uint256 constant MAX_BATCH_SIZE = 20;
 
     Currency currency0;
     Currency currency1;
@@ -47,7 +48,7 @@ contract CadenceHookInvariantTest is BaseTest {
         address flags = address(
             uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x4444 << 144)
         );
-        bytes memory constructorArgs = abi.encode(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS);
+        bytes memory constructorArgs = abi.encode(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE);
         deployCodeTo("CadenceHook.sol:CadenceHook", constructorArgs, flags);
         hook = CadenceHook(flags);
 
