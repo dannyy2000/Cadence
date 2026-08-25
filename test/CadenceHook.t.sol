@@ -441,4 +441,107 @@ contract CadenceHookTest is BaseTest {
         assertGt(currency0.balanceOf(trader1), 0, "oneForZero trader should receive currency0");
         assertEq(hook.queueLength(poolId), 0);
     }
+
+    /// @dev Verifies CLVR actually reorders trades rather than replaying arrival order, using
+    /// the exact worked example from the design conversation: a 100/100 pool (p0 = 1) with
+    /// orders {A: sell 5, B: sell 20, C: buy 10, D: buy 3}, submitted in arrival order
+    /// A, B, C, D. Hand-derivation (checked step by step against the paper's deviation
+    /// metric): D lands closest to p0 first (smallest trade against an undisturbed pool),
+    /// then A, then C, then B is forced last. Expected order: D, A, C, B.
+    function _deployClvrTestPool() private returns (CadenceHook clvrHook, PoolKey memory clvrPoolKey) {
+        (Currency clvrCurrency0, Currency clvrCurrency1) = deployCurrencyPair();
+
+        address flags2 =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x9999 << 144));
+        bytes memory constructorArgs2 = abi.encode(poolManager, uint256(1e18), BATCH_WINDOW_BLOCKS);
+        deployCodeTo("CadenceHook.sol:CadenceHook", constructorArgs2, flags2);
+        clvrHook = CadenceHook(flags2);
+
+        // fee = 0, matching the paper's frictionless simplification used in the hand-derivation.
+        clvrPoolKey = PoolKey(clvrCurrency0, clvrCurrency1, 0, 60, IHooks(clvrHook));
+        poolManager.initialize(clvrPoolKey, Constants.SQRT_PRICE_1_1);
+
+        int24 tickLower = TickMath.minUsableTick(clvrPoolKey.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(clvrPoolKey.tickSpacing);
+        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            100e18
+        );
+        positionManager.mint(
+            clvrPoolKey,
+            tickLower,
+            tickUpper,
+            100e18,
+            amount0Expected + 1,
+            amount1Expected + 1,
+            address(this),
+            block.timestamp,
+            Constants.ZERO_BYTES
+        );
+    }
+
+    function testCLVR_ExecutesInDeviationMinimizingOrder() public {
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+
+        address traderA = makeAddr("traderA_sell5");
+        address traderB = makeAddr("traderB_sell20");
+        address traderC = makeAddr("traderC_buy10");
+        address traderD = makeAddr("traderD_buy3");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 5e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(traderA),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 20e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(traderB),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(traderC),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 3e18,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(traderD),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(clvrHook.queueLength(clvrPoolId), 4);
+
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traderD, false, 3e18, 0);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traderA, true, 5e18, 1);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traderC, false, 10e18, 2);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traderB, true, 20e18, 3);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+
+        assertEq(clvrHook.queueLength(clvrPoolId), 0);
+    }
 }

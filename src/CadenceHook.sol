@@ -8,6 +8,10 @@ import {CurrencySettler} from "@openzeppelin/uniswap-hooks/src/utils/CurrencySet
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {SwapMath} from "@uniswap/v4-core/src/libraries/SwapMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 import {IPoolManager, SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -16,14 +20,16 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 
 /// @notice Batches large trades into fixed-length windows instead of letting them execute
-/// one at a time against the AMM curve, then settles the whole batch atomically. Settlement
-/// currently uses a naive sequential-execution placeholder rather than the CLVR ordering
-/// rule described in the project README — see `_settle` and MILESTONES.md for what that
-/// means and what M2 replaces it with.
+/// one at a time against the AMM curve, then settles the whole batch atomically using the
+/// CLVR ordering rule (McLaughlin, Chemaya, Liu & Malkhi, "CLVR Ordering of Transactions on
+/// AMMs", arXiv:2408.02634) — see `_settle` for the implementation and MILESTONES.md for
+/// what's still simplified relative to the paper (order-splitting resistance, gas-bounded
+/// batch size, etc. — the M2 hardening items, tracked separately from ordering itself).
 contract CadenceHook is BaseHook, IHookEvents {
     using PoolIdLibrary for PoolKey;
     using SafeCast for uint256;
     using CurrencySettler for Currency;
+    using StateLibrary for IPoolManager;
 
     struct QueuedOrder {
         address trader;
@@ -60,6 +66,12 @@ contract CadenceHook is BaseHook, IHookEvents {
         uint256 queuePosition,
         uint256 deadline
     );
+
+    /// @dev Emitted for each order as CLVR picks it, in the order it's actually executed -
+    /// which generally differs from queuePosition (arrival order). Exists so the execution
+    /// order is externally observable (for tests, and later for the frontend) without having
+    /// to decode raw PoolManager Swap events.
+    event OrderSettled(PoolId indexed poolId, address indexed trader, bool zeroForOne, uint256 amountIn, uint256 settlementStep);
 
     event BatchSettled(PoolId indexed poolId, uint256 ordersSettled);
 
@@ -201,43 +213,86 @@ contract CadenceHook is BaseHook, IHookEvents {
         return bytes("");
     }
 
-    /// @dev Naive placeholder clearing rule: executes each queued order sequentially against
-    /// the pool, within this one atomic transaction. Because it's all one transaction, none of
-    /// these trades can be sandwiched by an outside party — there's no gap between them for
-    /// anyone to insert into. What this does NOT yet give every order is the same clearing
-    /// price: the first order in the loop still gets a marginally better price than the last,
-    /// since each swap moves the pool price for the next. Replacing this loop with the CLVR
-    /// ordering rule (which computes a single deviation-minimizing settlement for the whole
-    /// batch instead of executing sequentially) is the M2 milestone.
+    /// @dev CLVR settlement: at each step, out of the orders not yet executed, run whichever
+    /// one would land the pool's price closest to the reference price captured before this
+    /// batch's settlement began — then actually execute it, and repeat. This is the O(n^2)
+    /// algorithm the paper presents and proves sandwich-attack resistance for in its main
+    /// text (Section 4.2 / Appendix C), not the O(n log n) reduction in Appendix G: with a
+    /// batch size that's already gas-bounded (M2 hardening item), the O(n^2) cost is
+    /// negligible, and it doesn't need a from-scratch balanced-tree structure to get right.
+    ///
+    /// Because it's all one atomic transaction, none of these trades can be sandwiched by an
+    /// outside party — there's no gap between them for anyone to insert into. CLVR is what
+    /// additionally makes the *internal* order fair, instead of leaving it as an arbitrary
+    /// array order the way the earlier placeholder did.
     function _settle(PoolId poolId, PoolKey memory key) internal {
         QueuedOrder[] memory orders = _batchQueue[poolId];
         uint256 n = orders.length;
+        if (n == 0) {
+            batchDeadline[poolId] = 0;
+            return;
+        }
+
+        (uint160 referenceSqrtPriceX96,,, uint24 lpFee) = poolManager.getSlot0(poolId);
+
+        bool[] memory settled = new bool[](n);
 
         _settling = true;
-        for (uint256 i = 0; i < n; i++) {
-            QueuedOrder memory order = orders[i];
+        for (uint256 step = 0; step < n; step++) {
+            (uint160 currentSqrtPriceX96,,,) = poolManager.getSlot0(poolId);
+            uint128 liquidity = poolManager.getLiquidity(poolId);
+
+            uint256 bestIndex = type(uint256).max;
+            uint256 bestDeviation = type(uint256).max;
+
+            // Simulate every not-yet-executed order against the current (real, just-read)
+            // pool state - a pure math projection via the same step function the pool itself
+            // uses internally, without spending gas on an actual swap - and keep whichever
+            // one deviates least from the reference price.
+            for (uint256 j = 0; j < n; j++) {
+                if (settled[j]) continue;
+
+                QueuedOrder memory candidate = orders[j];
+                uint160 sqrtPriceTargetX96 =
+                    candidate.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+
+                (uint160 resultingSqrtPriceX96,,,) = SwapMath.computeSwapStep(
+                    currentSqrtPriceX96, sqrtPriceTargetX96, liquidity, -int256(candidate.amountIn), lpFee
+                );
+
+                uint256 deviation = _deviationFromReference(referenceSqrtPriceX96, resultingSqrtPriceX96);
+                if (deviation < bestDeviation) {
+                    bestDeviation = deviation;
+                    bestIndex = j;
+                }
+            }
+
+            QueuedOrder memory winner = orders[bestIndex];
+            settled[bestIndex] = true;
+
+            emit OrderSettled(poolId, winner.trader, winner.zeroForOne, winner.amountIn, step);
 
             BalanceDelta delta = poolManager.swap(
                 key,
                 SwapParams({
-                    zeroForOne: order.zeroForOne,
-                    amountSpecified: -int256(order.amountIn),
-                    sqrtPriceLimitX96: order.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+                    zeroForOne: winner.zeroForOne,
+                    amountSpecified: -int256(winner.amountIn),
+                    sqrtPriceLimitX96: winner.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
                 }),
                 bytes("")
             );
 
-            Currency input = order.zeroForOne ? key.currency0 : key.currency1;
-            Currency output = order.zeroForOne ? key.currency1 : key.currency0;
+            Currency input = winner.zeroForOne ? key.currency0 : key.currency1;
+            Currency output = winner.zeroForOne ? key.currency1 : key.currency0;
 
             // Pay for this order's swap by burning the claim tokens taken from the trader
             // when they joined the queue.
-            input.settle(poolManager, address(this), order.amountIn, true);
+            input.settle(poolManager, address(this), winner.amountIn, true);
 
             // Send the real output tokens straight to whoever should receive them.
             uint256 outputAmount =
-                order.zeroForOne ? uint256(int256(delta.amount1())) : uint256(int256(delta.amount0()));
-            output.take(poolManager, order.trader, outputAmount, false);
+                winner.zeroForOne ? uint256(int256(delta.amount1())) : uint256(int256(delta.amount0()));
+            output.take(poolManager, winner.trader, outputAmount, false);
         }
         _settling = false;
 
@@ -245,6 +300,26 @@ contract CadenceHook is BaseHook, IHookEvents {
         batchDeadline[poolId] = 0;
 
         emit BatchSettled(poolId, n);
+    }
+
+    /// @dev Returns max(P/P0, P0/P) in Q96 fixed point, minimized at 1.0 exactly when P
+    /// equals the reference price P0. This is an argmin-equivalent stand-in for the paper's
+    /// (ln P0 - ln P)^2 deviation metric: minimizing |ln(P/P0)| is exactly minimizing
+    /// max(P/P0, P0/P), since ln is monotonic, so picking the smallest value of this function
+    /// always agrees with picking the smallest value of the paper's metric - without needing
+    /// an on-chain logarithm. Comparing sqrtPriceX96 ratios directly (rather than squaring to
+    /// actual price first) preserves the same ordering, since squaring is monotonic on
+    /// positive reals, and avoids the overflow risk of squaring Q96 numbers.
+    function _deviationFromReference(uint160 referenceSqrtPriceX96, uint160 resultingSqrtPriceX96)
+        private
+        pure
+        returns (uint256)
+    {
+        if (resultingSqrtPriceX96 >= referenceSqrtPriceX96) {
+            return FullMath.mulDiv(uint256(resultingSqrtPriceX96), FixedPoint96.Q96, uint256(referenceSqrtPriceX96));
+        } else {
+            return FullMath.mulDiv(uint256(referenceSqrtPriceX96), FixedPoint96.Q96, uint256(resultingSqrtPriceX96));
+        }
     }
 
     function queueLength(PoolId poolId) external view returns (uint256) {

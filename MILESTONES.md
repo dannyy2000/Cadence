@@ -75,8 +75,8 @@ of building on the first.
 ## Milestone 2 — due week two
 
 Contracts:
-- [ ] Real CLVR ordering algorithm replacing the placeholder clearing rule
-- [ ] Invariant tests on settlement *pricing* (e.g. no order in a batch deviates from the reference price by more than X) — deferred here since testing this against the M1 placeholder algorithm would be thrown away
+- [x] Real CLVR ordering algorithm replacing the placeholder clearing rule — implemented the O(n²) greedy rule from the paper's main text (Section 4.2), not the O(n log n) reduction (Appendix G), since batch size is already gas-capped and the simpler version is far easier to verify against the paper's own proofs. Verified against a hand-derived worked example (`testCLVR_ExecutesInDeviationMinimizingOrder`) — the contract reproduces the exact expected execution order for a batch submitted in a *different* arrival order, proving it actually reorders rather than replaying arrival order.
+- [ ] Invariant tests on settlement *pricing* (e.g. no order in a batch deviates from the reference price by more than X) — CLVR is in now, so this is unblocked; not yet written
 - [ ] Fix 1: order-splitting evasion — cumulative price-impact threshold check
 - [ ] Fix 2: one bad order griefing the batch — per-order feasibility check, skip-and-refund
 - [ ] Fix 3: unbounded settlement gas — max batch size, force-settle at cap

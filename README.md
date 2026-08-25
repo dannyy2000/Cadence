@@ -146,7 +146,7 @@ Cadence is built on three papers, each doing a distinct job.
 
 > *"CLVR Ordering of Transactions on AMMs"*, arXiv:2408.02634 (2024) [3]
 
-**What it proves:** given a group of trades to settle together, there is a specific ordering rule (CLVR) that minimizes how far every trade's execution price deviates from the true reference price across the whole batch — computable cheaply enough (≈ O(n log n)) to run inside a gas-metered smart contract.
+**What it proves:** given a group of trades to settle together, there is a specific greedy ordering rule (CLVR) that approximately minimizes how far every trade's execution price deviates from the true reference price across the whole batch — cheap enough to run inside a gas-metered smart contract. The paper presents this rule (and proves its resistance to the classic 3-transaction sandwich attack) at O(n²) computational cost; a reduction to O(n log n) exists but requires a balanced-tree structure the paper only sketches at a high level (Appendix G). Cadence implements the O(n²) version — with the batch size already capped for gas-safety reasons (see the security section below), the O(n²) cost is negligible, and it's far simpler to verify against the paper's own proofs than a from-scratch tree structure would be.
 
 **Role in Cadence:** this is the actual settlement engine — the "how" to Budish-Cramton-Shim's "why."
 
