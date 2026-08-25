@@ -94,6 +94,7 @@ contract CadenceHook is BaseHook, IHookEvents {
     event BatchSettled(PoolId indexed poolId, uint256 ordersSettled);
 
     error BatchNotDue();
+    error ReentrantSwapDuringSettlement();
 
     constructor(IPoolManager _poolManager, uint256 _batchThreshold, uint256 _batchWindowBlocks, uint256 _maxBatchSize)
         BaseHook(_poolManager)
@@ -130,9 +131,18 @@ contract CadenceHook is BaseHook, IHookEvents {
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         if (_settling) {
-            // One of this hook's own settlement swaps, calling back into this same
-            // beforeSwap. Pass it through untouched — it must not be re-queued or trigger
-            // settlement again, or settlement would recurse into itself.
+            // Only this hook's own settlement swaps - poolManager.swap() calls made
+            // directly by this contract, from inside _settle - are allowed through
+            // untouched while settlement is in progress. `sender` is whoever directly
+            // called poolManager.swap(); for our own internal swaps that's always
+            // address(this). Paying out a settled order can run external code (a native
+            // ETH transfer invokes the recipient's receive(); a nonstandard ERC20 could do
+            // the same from inside transfer()) - if that callback tried to sneak in its own
+            // swap here, it would otherwise execute at whatever mid-settlement price CLVR
+            // happened to be at that step, inserting an uncontrolled trade into what was
+            // supposed to be one atomic, fairly-ordered settlement. Reject anything that
+            // isn't genuinely us, rather than silently letting it through.
+            if (sender != address(this)) revert ReentrantSwapDuringSettlement();
             return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
 
@@ -247,6 +257,24 @@ contract CadenceHook is BaseHook, IHookEvents {
     /// so is already inside the `PoolManager`'s unlocked context), a standalone call here
     /// has to open that context itself before it's allowed to call `swap`/`take`/`settle` —
     /// hence the `unlock` round-trip instead of calling `_settle` directly.
+    ///
+    /// `key` is caller-supplied, but pool-key spoofing isn't a real avenue here: `poolId` is
+    /// `keccak256` of the entire key (currencies, fee, tickSpacing, and `hooks` together), the
+    /// same strong hash `PoolManager` itself uses, so `_batchQueue`/`batchDeadline` can only
+    /// ever have real entries at a `poolId` whose *only* valid preimage is the genuine key -
+    /// there's no separate, looser identifier a mismatched key could collide with. Passing an
+    /// unrelated key just derives an unrelated (empty) `poolId`, and `PoolManager.swap` itself
+    /// would revert on an uninitialized pool regardless.
+    ///
+    /// Sequential double-settlement (calling this twice for the same batch) is already closed
+    /// by the deadline check above: the first call clears `batchDeadline[poolId]` back to 0
+    /// before returning, so a second call reverts with `BatchNotDue` rather than re-running
+    /// `_settle` on an empty queue. Reentrant double-settlement (a second call arriving *during*
+    /// the first) is closed one layer down, in `PoolManager.unlock` itself, which reverts with
+    /// `AlreadyUnlocked` on any nested `unlock` call — independent of anything this contract
+    /// does. What neither of those covers is a *swap* (not a nested `settle` call) sneaking in
+    /// mid-settlement via a payout's external call; see the `sender != address(this)` check in
+    /// `_beforeSwap` for that.
     function settle(PoolKey calldata key) external {
         PoolId poolId = key.toId();
         uint256 deadline = batchDeadline[poolId];

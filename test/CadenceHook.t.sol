@@ -16,7 +16,10 @@ import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
 
+import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
+import {MaliciousReentrantToken} from "./utils/MaliciousReentrantToken.sol";
 
 import {CadenceHook} from "../src/CadenceHook.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
@@ -689,5 +692,112 @@ contract CadenceHookTest is BaseTest {
         clvrHook.settle(clvrPoolKey);
 
         assertEq(clvrHook.queueLength(clvrPoolId), 0);
+    }
+
+    /// @dev Proves the reentrancy guard actually blocks an attempted swap mid-settlement,
+    /// rather than just asserting the guard code looks right. Uses a token whose `transfer`
+    /// tries to swap directly against the pool the instant it's invoked - simulating a
+    /// nonstandard ERC20 with a transfer hook (the same real-world category as ERC777) - as
+    /// the payout currency for one queued order, so the attack fires from inside CadenceHook's
+    /// own settlement loop.
+    function _deployReentrancyTestPool()
+        private
+        returns (CadenceHook reHook, PoolKey memory rePoolKey, MockERC20 goodToken, MaliciousReentrantToken badToken, bool badIsCurrency1)
+    {
+        goodToken = new MockERC20("Good Token", "GOOD", 18);
+        badToken = new MaliciousReentrantToken("Bad Token", "BAD", 18);
+
+        goodToken.mint(address(this), 10_000_000 ether);
+        badToken.mint(address(this), 10_000_000 ether);
+
+        goodToken.approve(address(permit2), type(uint256).max);
+        goodToken.approve(address(swapRouter), type(uint256).max);
+        permit2.approve(address(goodToken), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(goodToken), address(poolManager), type(uint160).max, type(uint48).max);
+
+        badToken.approve(address(permit2), type(uint256).max);
+        badToken.approve(address(swapRouter), type(uint256).max);
+        permit2.approve(address(badToken), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(badToken), address(poolManager), type(uint160).max, type(uint48).max);
+
+        (Currency reCurrency0, Currency reCurrency1) = address(goodToken) < address(badToken)
+            ? (Currency.wrap(address(goodToken)), Currency.wrap(address(badToken)))
+            : (Currency.wrap(address(badToken)), Currency.wrap(address(goodToken)));
+        badIsCurrency1 = Currency.unwrap(reCurrency1) == address(badToken);
+
+        address flags3 =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x7777 << 144));
+        bytes memory constructorArgs3 = abi.encode(poolManager, uint256(1e18), BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE);
+        deployCodeTo("CadenceHook.sol:CadenceHook", constructorArgs3, flags3);
+        reHook = CadenceHook(flags3);
+
+        rePoolKey = PoolKey(reCurrency0, reCurrency1, 3000, 60, IHooks(reHook));
+        poolManager.initialize(rePoolKey, Constants.SQRT_PRICE_1_1);
+
+        int24 tickLower = TickMath.minUsableTick(rePoolKey.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(rePoolKey.tickSpacing);
+        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            1000e18
+        );
+        positionManager.mint(
+            rePoolKey,
+            tickLower,
+            tickUpper,
+            1000e18,
+            amount0Expected + 1,
+            amount1Expected + 1,
+            address(this),
+            block.timestamp,
+            Constants.ZERO_BYTES
+        );
+
+        badToken.arm(poolManager, rePoolKey);
+    }
+
+    function testReentrancy_SwapAttemptedDuringSettlementIsRejected() public {
+        (CadenceHook reHook, PoolKey memory rePoolKey, MockERC20 goodToken, MaliciousReentrantToken badToken, bool badIsCurrency1)
+        = _deployReentrancyTestPool();
+        PoolId rePoolId = rePoolKey.toId();
+
+        address victim = makeAddr("reentrancyVictim");
+        address otherTrader = makeAddr("reentrancyOtherTrader");
+
+        // This order's payout currency is the malicious token - settling it is what triggers
+        // the reentrancy attempt.
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: badIsCurrency1,
+            poolKey: rePoolKey,
+            hookData: abi.encode(victim),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // A second, unrelated order in the opposite direction - proves the attack attempt
+        // doesn't take down the rest of the batch with it.
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: !badIsCurrency1,
+            poolKey: rePoolKey,
+            hookData: abi.encode(otherTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(reHook.batchDeadline(rePoolId));
+        reHook.settle(rePoolKey);
+
+        assertTrue(badToken.reentryAttempted(), "malicious token should have attempted to reenter");
+        assertTrue(badToken.reentryReverted(), "the reentrant swap attempt must have been rejected");
+
+        // Settlement completed normally for everyone despite the attack attempt.
+        assertEq(reHook.queueLength(rePoolId), 0);
+        assertGt(badToken.balanceOf(victim), 0, "victim should still receive their real payout");
+        assertGt(goodToken.balanceOf(otherTrader), 0, "the other queued order should settle normally too");
     }
 }
