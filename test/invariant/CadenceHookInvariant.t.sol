@@ -106,4 +106,10 @@ contract CadenceHookInvariantTest is BaseTest {
             "hook's currency1 custody must match what's queued"
         );
     }
+
+    /// @dev The size-cap trigger force-settles as soon as the queue reaches maxBatchSize, so
+    /// it must never be observed sitting above that cap between handler calls.
+    function invariant_QueueNeverExceedsMaxBatchSize() public view {
+        assertLe(hook.queueLength(poolId), hook.maxBatchSize(), "queue must never exceed the configured cap");
+    }
 }

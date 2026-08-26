@@ -20,6 +20,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 import {MaliciousReentrantToken} from "./utils/MaliciousReentrantToken.sol";
+import {BlacklistingToken} from "./utils/BlacklistingToken.sol";
 
 import {CadenceHook} from "../src/CadenceHook.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
@@ -799,5 +800,953 @@ contract CadenceHookTest is BaseTest {
         assertEq(reHook.queueLength(rePoolId), 0);
         assertGt(badToken.balanceOf(victim), 0, "victim should still receive their real payout");
         assertGt(goodToken.balanceOf(otherTrader), 0, "the other queued order should settle normally too");
+    }
+
+    function _deployGriefingTestPool()
+        private
+        returns (CadenceHook grHook, PoolKey memory grPoolKey, MockERC20 goodToken, BlacklistingToken badToken)
+    {
+        goodToken = new MockERC20("Good Token", "GOOD", 18);
+        badToken = new BlacklistingToken("Blacklisting Token", "BLK", 18);
+
+        goodToken.mint(address(this), 10_000_000 ether);
+        badToken.mint(address(this), 10_000_000 ether);
+
+        goodToken.approve(address(permit2), type(uint256).max);
+        goodToken.approve(address(swapRouter), type(uint256).max);
+        permit2.approve(address(goodToken), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(goodToken), address(poolManager), type(uint160).max, type(uint48).max);
+
+        badToken.approve(address(permit2), type(uint256).max);
+        badToken.approve(address(swapRouter), type(uint256).max);
+        permit2.approve(address(badToken), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(badToken), address(poolManager), type(uint160).max, type(uint48).max);
+
+        (Currency grCurrency0, Currency grCurrency1) = address(goodToken) < address(badToken)
+            ? (Currency.wrap(address(goodToken)), Currency.wrap(address(badToken)))
+            : (Currency.wrap(address(badToken)), Currency.wrap(address(goodToken)));
+
+        address flags4 =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x8888 << 144));
+        bytes memory constructorArgs4 = abi.encode(poolManager, uint256(1e18), BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE);
+        deployCodeTo("CadenceHook.sol:CadenceHook", constructorArgs4, flags4);
+        grHook = CadenceHook(flags4);
+
+        grPoolKey = PoolKey(grCurrency0, grCurrency1, 3000, 60, IHooks(grHook));
+        poolManager.initialize(grPoolKey, Constants.SQRT_PRICE_1_1);
+
+        int24 tickLower = TickMath.minUsableTick(grPoolKey.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(grPoolKey.tickSpacing);
+        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            1000e18
+        );
+        positionManager.mint(
+            grPoolKey,
+            tickLower,
+            tickUpper,
+            1000e18,
+            amount0Expected + 1,
+            amount1Expected + 1,
+            address(this),
+            block.timestamp,
+            Constants.ZERO_BYTES
+        );
+    }
+
+    /// @dev Proves one order's real execution failing doesn't abort the rest of the batch,
+    /// using a realistic, well-documented failure mode: a payout currency (BlacklistingToken,
+    /// modeling USDC/USDT-style address blacklisting) that reverts for one specific recipient.
+    function testGriefing_OneBadOrderDoesNotRevertTheWholeBatch() public {
+        (CadenceHook grHook, PoolKey memory grPoolKey, MockERC20 goodToken, BlacklistingToken badToken) =
+            _deployGriefingTestPool();
+        PoolId grPoolId = grPoolKey.toId();
+        bool badIsCurrency1 = Currency.unwrap(grPoolKey.currency1) == address(badToken);
+
+        address blacklistedTrader = makeAddr("blacklistedTrader");
+        address normalTrader = makeAddr("normalTrader");
+        badToken.setBlacklisted(blacklistedTrader);
+
+        // This order's payout currency is the blacklisting token, to a recipient that token
+        // has blacklisted - its real execution will fail.
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: badIsCurrency1,
+            poolKey: grPoolKey,
+            hookData: abi.encode(blacklistedTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // A second, unrelated order in the opposite direction - proves it settles normally
+        // despite the other order's failure.
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: !badIsCurrency1,
+            poolKey: grPoolKey,
+            hookData: abi.encode(normalTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // The blacklisted order's direction was chosen (zeroForOne: badIsCurrency1) so its
+        // output is always badToken - meaning its input is always goodToken, regardless of
+        // which currency slot badToken ended up in.
+        uint256 blacklistedTraderInputBalanceBefore = goodToken.balanceOf(blacklistedTrader);
+
+        vm.roll(grHook.batchDeadline(grPoolId));
+        grHook.settle(grPoolKey);
+
+        // Settlement completed for everyone - the whole transaction did not revert.
+        assertEq(grHook.queueLength(grPoolId), 0);
+
+        // The blacklisted trader never received the blacklisted payout currency...
+        assertEq(badToken.balanceOf(blacklistedTrader), 0, "blacklisted trader must not receive the payout");
+        // ...but got their original input currency (goodToken) refunded instead of losing it.
+        assertGt(
+            goodToken.balanceOf(blacklistedTrader),
+            blacklistedTraderInputBalanceBefore,
+            "blacklisted trader should be refunded their original input"
+        );
+
+        // The other, unaffected order settled completely normally.
+        assertGt(goodToken.balanceOf(normalTrader), 0, "unaffected order must still settle normally");
+    }
+
+    function testFuzz_RefundExactlyMatchesOriginalInput(uint256 amountIn) public {
+        amountIn = bound(amountIn, 1e18, 50e18);
+
+        (CadenceHook grHook, PoolKey memory grPoolKey, MockERC20 goodToken, BlacklistingToken badToken) =
+            _deployGriefingTestPool();
+        PoolId grPoolId = grPoolKey.toId();
+        bool badIsCurrency1 = Currency.unwrap(grPoolKey.currency1) == address(badToken);
+
+        address blacklistedTrader = makeAddr("fuzzBlacklistedTrader");
+        badToken.setBlacklisted(blacklistedTrader);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: badIsCurrency1,
+            poolKey: grPoolKey,
+            hookData: abi.encode(blacklistedTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(grHook.batchDeadline(grPoolId));
+        grHook.settle(grPoolKey);
+
+        assertEq(goodToken.balanceOf(blacklistedTrader), amountIn, "refund must exactly match original input");
+    }
+
+    // ---------------------------------------------------------------------
+    // Access control
+    // ---------------------------------------------------------------------
+
+    function test_UnlockCallback_RevertsIfNotCalledByPoolManager() public {
+        vm.expectRevert();
+        hook.unlockCallback(abi.encode(poolKey));
+    }
+
+    function test_ExecuteOrder_RevertsIfNotCalledBySelf() public {
+        CadenceHook.QueuedOrder memory fakeOrder =
+            CadenceHook.QueuedOrder({trader: address(this), zeroForOne: true, amountIn: 1e18, blockNumber: block.number});
+        vm.expectRevert(CadenceHook.OnlySelf.selector);
+        hook._executeOrder(poolKey, fakeOrder);
+    }
+
+    function testConstructor_RevertsIfBatchWindowBlocksIsZero() public {
+        address flags5 =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0xAAAA << 144));
+        bytes memory badArgs = abi.encode(poolManager, BATCH_THRESHOLD, uint256(0), MAX_BATCH_SIZE);
+        vm.expectRevert(bytes("batchWindowBlocks must be > 0"));
+        deployCodeTo("CadenceHook.sol:CadenceHook", badArgs, flags5);
+    }
+
+    function testConstructor_RevertsIfMaxBatchSizeIsZero() public {
+        address flags6 =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0xBBBB << 144));
+        bytes memory badArgs = abi.encode(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS, uint256(0));
+        vm.expectRevert(bytes("maxBatchSize must be > 0"));
+        deployCodeTo("CadenceHook.sol:CadenceHook", badArgs, flags6);
+    }
+
+    // ---------------------------------------------------------------------
+    // View function edge cases
+    // ---------------------------------------------------------------------
+
+    function testBlocksUntilDeadline_ZeroWhenNoBatchOpen() public view {
+        assertEq(hook.blocksUntilDeadline(poolId), 0);
+    }
+
+    function testBlocksUntilDeadline_CorrectCountdown() public {
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        assertEq(hook.blocksUntilDeadline(poolId), BATCH_WINDOW_BLOCKS);
+
+        vm.roll(block.number + 3);
+        assertEq(hook.blocksUntilDeadline(poolId), BATCH_WINDOW_BLOCKS - 3);
+    }
+
+    function testBlocksUntilDeadline_ZeroWhenOverdue() public {
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        vm.roll(hook.batchDeadline(poolId) + 5);
+        assertEq(hook.blocksUntilDeadline(poolId), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Multi-pool isolation
+    // ---------------------------------------------------------------------
+
+    function _initSecondPoolOnSameHook() private returns (PoolKey memory poolKey2, PoolId poolId2) {
+        (Currency currency2, Currency currency3) = deployCurrencyPair();
+        poolKey2 = PoolKey(currency2, currency3, 3000, 60, IHooks(hook));
+        poolId2 = poolKey2.toId();
+        poolManager.initialize(poolKey2, Constants.SQRT_PRICE_1_1);
+
+        int24 tickLower = TickMath.minUsableTick(poolKey2.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(poolKey2.tickSpacing);
+        uint128 liquidityAmount = 1000e18;
+        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            liquidityAmount
+        );
+        positionManager.mint(
+            poolKey2,
+            tickLower,
+            tickUpper,
+            liquidityAmount,
+            amount0Expected + 1,
+            amount1Expected + 1,
+            address(this),
+            block.timestamp,
+            Constants.ZERO_BYTES
+        );
+    }
+
+    function testMultiPool_QueuesAreIndependent() public {
+        (PoolKey memory poolKey2, PoolId poolId2) = _initSecondPoolOnSameHook();
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(hook.queueLength(poolId), 1);
+        assertEq(hook.queueLength(poolId2), 0, "second pool's queue must be untouched");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 8e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey2,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(hook.queueLength(poolId), 1, "first pool's queue must be untouched by the second pool's order");
+        assertEq(hook.queueLength(poolId2), 1);
+    }
+
+    function testMultiPool_SettlingOneDoesNotAffectTheOther() public {
+        (PoolKey memory poolKey2, PoolId poolId2) = _initSecondPoolOnSameHook();
+        address trader1 = makeAddr("multiPoolTrader1");
+        address trader2 = makeAddr("multiPoolTrader2");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(trader1),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 8e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey2,
+            hookData: abi.encode(trader2),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(hook.batchDeadline(poolId));
+        hook.settle(poolKey);
+
+        assertEq(hook.queueLength(poolId), 0);
+        assertEq(hook.queueLength(poolId2), 1, "settling pool 1 must not touch pool 2's queue");
+        assertGt(currency1.balanceOf(trader1), 0);
+    }
+
+    function testFuzz_MaxBatchSizeNeverExceeded(uint8 rawExtraOrders) public {
+        uint256 totalOrders = MAX_BATCH_SIZE + bound(rawExtraOrders, 0, 10);
+
+        for (uint256 i = 0; i < totalOrders; i++) {
+            swapRouter.swapExactTokensForTokens({
+                amountIn: 10e18,
+                amountOutMin: 0,
+                zeroForOne: i % 2 == 0,
+                poolKey: poolKey,
+                hookData: abi.encode(makeAddr(string.concat("capFuzzTrader", vm.toString(i)))),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+            assertLe(hook.queueLength(poolId), MAX_BATCH_SIZE, "queue must never exceed the configured cap");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // More CLVR worked examples, and Fix 5 (deterministic tie-breaking)
+    // ---------------------------------------------------------------------
+
+    function testCLVR_SingleOrder_ExecutesAlone() public {
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+        address trader = makeAddr("soloTrader");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 5e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(trader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, trader, true, 5e18, 0);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+
+        assertEq(clvrHook.queueLength(clvrPoolId), 0);
+    }
+
+    /// @dev Per the paper (Section 5.7): with exactly two same-direction pending trades, the
+    /// optimal ordering that minimizes price volatility always executes the smaller one first.
+    function testCLVR_TwoOrders_SmallerExecutesFirst() public {
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+        address smallTrader = makeAddr("smallTrader");
+        address largeTrader = makeAddr("largeTrader");
+
+        // Submitted large-first, small-second - the opposite of the expected execution order.
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 20e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(largeTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 3e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(smallTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, smallTrader, true, 3e18, 0);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, largeTrader, true, 20e18, 1);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+    }
+
+    /// @dev Per the paper (Section 5.7): when every pending trade moves price in the same
+    /// direction, the optimal ordering executes smallest to largest.
+    function testCLVR_AllSameDirection_ExecutesSmallestToLargest() public {
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+
+        uint256[4] memory amounts = [uint256(8e18), 2e18, 15e18, 5e18];
+        address[4] memory traders;
+        for (uint256 i = 0; i < 4; i++) {
+            traders[i] = makeAddr(string.concat("scrambledTrader", vm.toString(i)));
+            swapRouter.swapExactTokensForTokens({
+                amountIn: amounts[i],
+                amountOutMin: 0,
+                zeroForOne: true,
+                poolKey: clvrPoolKey,
+                hookData: abi.encode(traders[i]),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+        }
+
+        // Expected order by size: traders[1] (2e18), traders[3] (5e18), traders[0] (8e18),
+        // traders[2] (15e18) - not the scrambled arrival order they were submitted in.
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traders[1], true, 2e18, 0);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traders[3], true, 5e18, 1);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traders[0], true, 8e18, 2);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traders[2], true, 15e18, 3);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+    }
+
+    /// @dev Fix 5: two orders with identical direction and size produce an exact deviation
+    /// tie at every step. CLVR must deterministically prefer whichever arrived first - never
+    /// a discretionary or ambiguous choice.
+    function testCLVR_TieBreaksByArrivalOrder() public {
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+        address firstTrader = makeAddr("tieFirstTrader");
+        address secondTrader = makeAddr("tieSecondTrader");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 5e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(firstTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 5e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(secondTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, firstTrader, true, 5e18, 0);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, secondTrader, true, 5e18, 1);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+    }
+
+    function testFuzz_CLVR_TieBreaksByArrivalOrder(uint256 tiedAmount, bool direction) public {
+        tiedAmount = bound(tiedAmount, 1e18, 40e18);
+
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+        address firstTrader = makeAddr("fuzzTieFirst");
+        address secondTrader = makeAddr("fuzzTieSecond");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: tiedAmount,
+            amountOutMin: 0,
+            zeroForOne: direction,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(firstTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: tiedAmount,
+            amountOutMin: 0,
+            zeroForOne: direction,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(secondTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, firstTrader, direction, tiedAmount, 0);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, secondTrader, direction, tiedAmount, 1);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+    }
+
+    function testFuzz_CLVR_SettlesEveryOrderExactlyOnce(uint8 rawCount, uint256 seed) public {
+        uint256 count = bound(rawCount, 2, 10);
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+
+        for (uint256 i = 0; i < count; i++) {
+            address trader = makeAddr(string.concat("completenessTrader", vm.toString(i)));
+            uint256 amt = bound(uint256(keccak256(abi.encode(seed, i))), 1e18, 30e18);
+            bool dir = uint256(keccak256(abi.encode(seed, i, "dir"))) % 2 == 0;
+            swapRouter.swapExactTokensForTokens({
+                amountIn: amt,
+                amountOutMin: 0,
+                zeroForOne: dir,
+                poolKey: clvrPoolKey,
+                hookData: abi.encode(trader),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+        }
+
+        assertEq(clvrHook.queueLength(clvrPoolId), count);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+
+        assertEq(clvrHook.queueLength(clvrPoolId), 0, "every queued order must be settled, none left behind");
+        assertEq(clvrHook.batchDeadline(clvrPoolId), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // hookData and exact-output edge cases
+    // ---------------------------------------------------------------------
+
+    function testHookData_WrongLengthFallsBackToSender() public {
+        // hookData that's neither empty nor exactly 32 bytes should fall back to `sender`
+        // (the router), not attempt to decode garbage as an address.
+        bytes memory oddLength = new bytes(5);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: oddLength,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        CadenceHook.QueuedOrder memory order = hook.queuedOrder(poolId, 0);
+        assertEq(order.trader, address(swapRouter));
+    }
+
+    function testExactOutputSwap_DoesNotContributeToCumulativeWindow() public {
+        // Exact-output swaps must never feed the below-threshold cumulative tracker - they're
+        // out of scope for batching entirely, not just individually small.
+        for (uint256 i = 0; i < 3; i++) {
+            swapRouter.swapTokensForExactTokens({
+                amountOut: 1e18,
+                amountInMax: type(uint256).max,
+                zeroForOne: true,
+                poolKey: poolKey,
+                hookData: Constants.ZERO_BYTES,
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+        }
+
+        // If exact-output swaps had incorrectly fed the cumulative tracker, this genuinely
+        // small exact-input trade could already have crossed the threshold by now.
+        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+            amountIn: 1e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        assertGt(swapDelta.amount1(), 0, "small trade should still execute instantly");
+        assertEq(hook.queueLength(poolId), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Deadline boundary precision
+    // ---------------------------------------------------------------------
+
+    function testSettlement_OneBlockBeforeDeadline_DoesNotAutoSettle() public {
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        uint256 deadline = hook.batchDeadline(poolId);
+        vm.roll(deadline - 1);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 1e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // Still one block shy of the deadline - the earlier batch must still be open.
+        assertEq(hook.batchDeadline(poolId), deadline);
+        assertGt(hook.queueLength(poolId), 0);
+    }
+
+    function testSettlement_ExactlyAtDeadlineBlock_AutoSettles() public {
+        address beneficiary = makeAddr("exactDeadlineTrader");
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(beneficiary),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        uint256 deadline = hook.batchDeadline(poolId);
+        vm.roll(deadline);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 1e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertGt(currency1.balanceOf(beneficiary), 0, "batch must settle exactly at the deadline block, not after");
+    }
+
+    // ---------------------------------------------------------------------
+    // Multiple consecutive batches
+    // ---------------------------------------------------------------------
+
+    function testMultipleBatches_SecondBatchOpensCleanlyAfterFirstSettles() public {
+        address firstBeneficiary = makeAddr("firstBatchTrader");
+        address secondBeneficiary = makeAddr("secondBatchTrader");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(firstBeneficiary),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        vm.roll(hook.batchDeadline(poolId));
+        hook.settle(poolKey);
+        assertEq(hook.queueLength(poolId), 0);
+        assertEq(hook.batchDeadline(poolId), 0);
+
+        // A second batch should open fresh, completely independent of the first.
+        uint256 secondBatchStartBlock = block.number;
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 12e18,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: poolKey,
+            hookData: abi.encode(secondBeneficiary),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(hook.queueLength(poolId), 1);
+        assertEq(hook.batchDeadline(poolId), secondBatchStartBlock + BATCH_WINDOW_BLOCKS);
+
+        vm.roll(hook.batchDeadline(poolId));
+        hook.settle(poolKey);
+
+        assertGt(currency1.balanceOf(firstBeneficiary), 0);
+        assertGt(currency0.balanceOf(secondBeneficiary), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Constructor parameters, fuzzed
+    // ---------------------------------------------------------------------
+
+    function _deployCustomPool(uint256 threshold, uint256 window, uint256 maxSize, uint160 saltBits)
+        private
+        returns (CadenceHook customHook, PoolKey memory customPoolKey)
+    {
+        address flagsAddr =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (saltBits << 144));
+        bytes memory args = abi.encode(poolManager, threshold, window, maxSize);
+        deployCodeTo("CadenceHook.sol:CadenceHook", args, flagsAddr);
+        customHook = CadenceHook(flagsAddr);
+
+        (Currency c0, Currency c1) = deployCurrencyPair();
+        customPoolKey = PoolKey(c0, c1, 3000, 60, IHooks(customHook));
+        poolManager.initialize(customPoolKey, Constants.SQRT_PRICE_1_1);
+
+        int24 tickLower = TickMath.minUsableTick(customPoolKey.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(customPoolKey.tickSpacing);
+        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            1000e18
+        );
+        positionManager.mint(
+            customPoolKey,
+            tickLower,
+            tickUpper,
+            1000e18,
+            amount0Expected + 1,
+            amount1Expected + 1,
+            address(this),
+            block.timestamp,
+            Constants.ZERO_BYTES
+        );
+    }
+
+    function testFuzz_ConstructorParams_ThresholdRespectedAcrossConfigs(uint256 customThreshold, uint256 testAmount)
+        public
+    {
+        customThreshold = bound(customThreshold, 1e15, 20e18);
+        testAmount = bound(testAmount, 1e14, 30e18);
+
+        (CadenceHook customHook, PoolKey memory customPoolKey) =
+            _deployCustomPool(customThreshold, BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE, 0xCCCC);
+        PoolId customPoolId = customPoolKey.toId();
+
+        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+            amountIn: testAmount,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: customPoolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        if (testAmount < customThreshold) {
+            assertGt(swapDelta.amount1(), 0);
+            assertEq(customHook.queueLength(customPoolId), 0);
+        } else {
+            assertEq(swapDelta.amount1(), 0);
+            assertEq(customHook.queueLength(customPoolId), 1);
+        }
+    }
+
+    function testFuzz_ConstructorParams_WindowLengthRespected(uint256 customWindow) public {
+        customWindow = bound(customWindow, 1, 200);
+
+        (CadenceHook customHook, PoolKey memory customPoolKey) =
+            _deployCustomPool(1e18, customWindow, MAX_BATCH_SIZE, 0xDDDD);
+        uint256 startBlock = block.number;
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 5e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: customPoolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(customHook.batchDeadline(customPoolKey.toId()), startBlock + customWindow);
+    }
+
+    function testFuzz_ConstructorParams_MaxBatchSizeRespected(uint8 rawCustomMax) public {
+        uint256 customMax = bound(rawCustomMax, 1, 15);
+
+        (CadenceHook customHook, PoolKey memory customPoolKey) =
+            _deployCustomPool(1e18, BATCH_WINDOW_BLOCKS, customMax, 0xEEEE);
+        PoolId customPoolId = customPoolKey.toId();
+
+        for (uint256 i = 0; i < customMax; i++) {
+            swapRouter.swapExactTokensForTokens({
+                amountIn: 5e18,
+                amountOutMin: 0,
+                zeroForOne: true,
+                poolKey: customPoolKey,
+                hookData: abi.encode(makeAddr(string.concat("customCapTrader", vm.toString(i)))),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+            assertLe(customHook.queueLength(customPoolId), customMax);
+        }
+        assertEq(customHook.queueLength(customPoolId), 0, "must force-settle exactly at the custom cap");
+    }
+
+    // ---------------------------------------------------------------------
+    // Direction symmetry
+    // ---------------------------------------------------------------------
+
+    function testCLVR_TwoOrders_SmallerExecutesFirst_OppositeDirection() public {
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+        address smallTrader = makeAddr("smallBuyTrader");
+        address largeTrader = makeAddr("largeBuyTrader");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 20e18,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(largeTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 3e18,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(smallTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, smallTrader, false, 3e18, 0);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, largeTrader, false, 20e18, 1);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+    }
+
+    // ---------------------------------------------------------------------
+    // Event field verification
+    // ---------------------------------------------------------------------
+
+    function testOrderQueued_EventFieldsAreCorrect() public {
+        address trader = makeAddr("eventFieldsTrader");
+        uint256 amountIn = 12e18;
+        uint256 expectedDeadline = block.number + BATCH_WINDOW_BLOCKS;
+
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit CadenceHook.OrderQueued(poolId, trader, true, amountIn, 0, expectedDeadline);
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(trader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+    }
+
+    function testBatchSettled_EventReportsCorrectOrderCount() public {
+        for (uint256 i = 0; i < 3; i++) {
+            swapRouter.swapExactTokensForTokens({
+                amountIn: 10e18,
+                amountOutMin: 0,
+                zeroForOne: i % 2 == 0,
+                poolKey: poolKey,
+                hookData: abi.encode(makeAddr(string.concat("batchCountTrader", vm.toString(i)))),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+        }
+
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit CadenceHook.BatchSettled(poolId, 3);
+
+        vm.roll(hook.batchDeadline(poolId));
+        hook.settle(poolKey);
+    }
+
+    function testOrderSkipped_EventFieldsAreCorrect() public {
+        (CadenceHook grHook, PoolKey memory grPoolKey, MockERC20 goodToken, BlacklistingToken badToken) =
+            _deployGriefingTestPool();
+        PoolId grPoolId = grPoolKey.toId();
+        bool badIsCurrency1 = Currency.unwrap(grPoolKey.currency1) == address(badToken);
+        address blacklistedTrader = makeAddr("skippedEventTrader");
+        badToken.setBlacklisted(blacklistedTrader);
+        goodToken; // silence unused-var warning; balances aren't checked in this event-focused test
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: badIsCurrency1,
+            poolKey: grPoolKey,
+            hookData: abi.encode(blacklistedTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.expectEmit(true, true, false, true, address(grHook));
+        emit CadenceHook.OrderSkipped(grPoolId, blacklistedTrader, badIsCurrency1, 10e18, 0);
+
+        vm.roll(grHook.batchDeadline(grPoolId));
+        grHook.settle(grPoolKey);
+    }
+
+    // ---------------------------------------------------------------------
+    // Configuration boundary values
+    // ---------------------------------------------------------------------
+
+    function testConfig_ZeroThreshold_AlwaysQueuesEveryTrade() public {
+        // batchThreshold = 0 is a valid, if extreme, configuration: every exact-input trade
+        // (specifiedAmount is never negative) meets "amount >= threshold" and queues.
+        (CadenceHook customHook, PoolKey memory customPoolKey) =
+            _deployCustomPool(0, BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE, 0xFFFF);
+        PoolId customPoolId = customPoolKey.toId();
+
+        BalanceDelta swapDelta = swapRouter.swapExactTokensForTokens({
+            amountIn: 1e14, // tiny by any normal standard
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: customPoolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        assertEq(swapDelta.amount1(), 0, "even a tiny trade must queue when threshold is zero");
+        assertEq(customHook.queueLength(customPoolId), 1);
+    }
+
+    function testConfig_MaxBatchSizeOfOne_SettlesEachOrderAlone() public {
+        // maxBatchSize = 1 means every above-threshold order force-settles itself immediately
+        // - the batch never actually accumulates more than one order at a time.
+        (CadenceHook customHook, PoolKey memory customPoolKey) =
+            _deployCustomPool(1e18, BATCH_WINDOW_BLOCKS, 1, 0x1234);
+        PoolId customPoolId = customPoolKey.toId();
+        address trader = makeAddr("soloCapTrader");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 5e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: customPoolKey,
+            hookData: abi.encode(trader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        // Settled immediately within the same call that queued it - never sat in the queue
+        // waiting for a second order or the deadline.
+        assertEq(customHook.queueLength(customPoolId), 0);
+        assertEq(customHook.batchDeadline(customPoolId), 0);
     }
 }

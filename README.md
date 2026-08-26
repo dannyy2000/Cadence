@@ -177,8 +177,8 @@ Five concrete failure modes were identified and closed. Each has real precedent 
 <tr><td>2️⃣</td><td>
 
 **One bad order griefing the whole batch**
-**Risk:** a single malformed order (e.g. impossible slippage bounds) could revert the entire settlement transaction — a documented failure pattern elsewhere in DeFi (Polymarket's "Ghost Fills").
-**Fix:** each order's feasibility is checked individually before settlement commits. A failing order is skipped and refunded on its own — it never aborts the rest of the batch.
+**Risk:** a single order whose real execution fails — most concretely, a payout currency that reverts for a specific recipient (USDC/USDT-style address blacklisting is real and documented) — could revert the entire settlement transaction and strand every other order in the batch along with it, a documented failure pattern elsewhere in DeFi (Polymarket's "Ghost Fills").
+**Fix:** each order executes in isolation (a self-call wrapped in try/catch); a failure is caught and that order is refunded its original input on its own, instead of aborting the rest of the batch. Verified with a token that reverts for one specific recipient — the other, unrelated order in the same batch still settles normally.
 
 </td></tr>
 <tr><td>3️⃣</td><td>

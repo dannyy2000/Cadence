@@ -91,10 +91,15 @@ contract CadenceHook is BaseHook, IHookEvents {
     /// to decode raw PoolManager Swap events.
     event OrderSettled(PoolId indexed poolId, address indexed trader, bool zeroForOne, uint256 amountIn, uint256 settlementStep);
 
+    /// @dev Emitted instead of OrderSettled when an order's real execution fails and it gets
+    /// refunded rather than paid out - see `_executeOrder`/`_refundOrder`.
+    event OrderSkipped(PoolId indexed poolId, address indexed trader, bool zeroForOne, uint256 amountIn, uint256 settlementStep);
+
     event BatchSettled(PoolId indexed poolId, uint256 ordersSettled);
 
     error BatchNotDue();
     error ReentrantSwapDuringSettlement();
+    error OnlySelf();
 
     constructor(IPoolManager _poolManager, uint256 _batchThreshold, uint256 _batchWindowBlocks, uint256 _maxBatchSize)
         BaseHook(_poolManager)
@@ -338,6 +343,13 @@ contract CadenceHook is BaseHook, IHookEvents {
                 );
 
                 uint256 deviation = _deviationFromReference(referenceSqrtPriceX96, resultingSqrtPriceX96);
+                // Strictly-less-than only: on an exact tie between two candidates, the
+                // earlier one (lower j, i.e. whichever arrived at the queue first) keeps
+                // `bestIndex` rather than being overwritten. Since `j` is scanned in a fixed,
+                // deterministic order every time, this makes tie-breaking deterministic by
+                // original submission order with no extra state or explicit rule needed - no
+                // party, including the contract itself, ever makes a discretionary choice
+                // between equally-valid orderings.
                 if (deviation < bestDeviation) {
                     bestDeviation = deviation;
                     bestIndex = j;
@@ -347,29 +359,18 @@ contract CadenceHook is BaseHook, IHookEvents {
             QueuedOrder memory winner = orders[bestIndex];
             settled[bestIndex] = true;
 
-            emit OrderSettled(poolId, winner.trader, winner.zeroForOne, winner.amountIn, step);
-
-            BalanceDelta delta = poolManager.swap(
-                key,
-                SwapParams({
-                    zeroForOne: winner.zeroForOne,
-                    amountSpecified: -int256(winner.amountIn),
-                    sqrtPriceLimitX96: winner.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-                }),
-                bytes("")
-            );
-
-            Currency input = winner.zeroForOne ? key.currency0 : key.currency1;
-            Currency output = winner.zeroForOne ? key.currency1 : key.currency0;
-
-            // Pay for this order's swap by burning the claim tokens taken from the trader
-            // when they joined the queue.
-            input.settle(poolManager, address(this), winner.amountIn, true);
-
-            // Send the real output tokens straight to whoever should receive them.
-            uint256 outputAmount =
-                winner.zeroForOne ? uint256(int256(delta.amount1())) : uint256(int256(delta.amount0()));
-            output.take(poolManager, winner.trader, outputAmount, false);
+            // One malformed or now-infeasible order (e.g. a payout currency that blacklists
+            // its recipient, or reverts for its own reasons) must not revert the whole
+            // settlement transaction and strand every other order in the batch along with it
+            // - a documented real failure pattern elsewhere in DeFi. _executeOrder does the
+            // real work; a failure there is caught and the order is refunded on its own
+            // instead of aborting the rest of the batch.
+            try this._executeOrder(key, winner) {
+                emit OrderSettled(poolId, winner.trader, winner.zeroForOne, winner.amountIn, step);
+            } catch {
+                _refundOrder(key, winner);
+                emit OrderSkipped(poolId, winner.trader, winner.zeroForOne, winner.amountIn, step);
+            }
         }
         _settling = false;
 
@@ -377,6 +378,45 @@ contract CadenceHook is BaseHook, IHookEvents {
         batchDeadline[poolId] = 0;
 
         emit BatchSettled(poolId, n);
+    }
+
+    /// @dev Executes one order's swap and pays out its output. External (rather than
+    /// internal) only so `_settle`'s loop can wrap it in try/catch - Solidity's try/catch
+    /// requires an external call. Restricted to the hook calling itself; nothing else should
+    /// ever call this directly.
+    function _executeOrder(PoolKey calldata key, QueuedOrder calldata order) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+
+        BalanceDelta delta = poolManager.swap(
+            key,
+            SwapParams({
+                zeroForOne: order.zeroForOne,
+                amountSpecified: -int256(order.amountIn),
+                sqrtPriceLimitX96: order.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            bytes("")
+        );
+
+        Currency input = order.zeroForOne ? key.currency0 : key.currency1;
+        Currency output = order.zeroForOne ? key.currency1 : key.currency0;
+
+        // Pay for this order's swap by burning the claim tokens taken from the trader
+        // when they joined the queue.
+        input.settle(poolManager, address(this), order.amountIn, true);
+
+        // Send the real output tokens straight to whoever should receive them.
+        uint256 outputAmount =
+            order.zeroForOne ? uint256(int256(delta.amount1())) : uint256(int256(delta.amount0()));
+        output.take(poolManager, order.trader, outputAmount, false);
+    }
+
+    /// @dev Gives back exactly the input custody an order took at queue time, in its
+    /// original input currency - used when that order's real execution failed and got
+    /// skipped, so the trader isn't left with tokens stuck in the hook forever.
+    function _refundOrder(PoolKey memory key, QueuedOrder memory order) internal {
+        Currency input = order.zeroForOne ? key.currency0 : key.currency1;
+        input.settle(poolManager, address(this), order.amountIn, true);
+        input.take(poolManager, order.trader, order.amountIn, false);
     }
 
     /// @dev Returns max(P/P0, P0/P) in Q96 fixed point, minimized at 1.0 exactly when P
