@@ -21,6 +21,7 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 import {MaliciousReentrantToken} from "./utils/MaliciousReentrantToken.sol";
 import {BlacklistingToken} from "./utils/BlacklistingToken.sol";
+import {SettleReentrantToken, ISettleCallable} from "./utils/SettleReentrantToken.sol";
 
 import {CadenceHook} from "../src/CadenceHook.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
@@ -1748,5 +1749,232 @@ contract CadenceHookTest is BaseTest {
         // waiting for a second order or the deadline.
         assertEq(customHook.queueLength(customPoolId), 0);
         assertEq(customHook.batchDeadline(customPoolId), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Gas benchmarking
+    // ---------------------------------------------------------------------
+
+    function testGas_SingleOrderQueueing() public {
+        uint256 gasBefore = gasleft();
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        uint256 gasUsed = gasBefore - gasleft();
+
+        assertLt(gasUsed, 500_000, "queueing a single order should be cheap - no settlement work happens here");
+    }
+
+    function testGas_SettlementAtMaxBatchSize() public {
+        for (uint256 i = 0; i < MAX_BATCH_SIZE - 1; i++) {
+            swapRouter.swapExactTokensForTokens({
+                amountIn: 10e18,
+                amountOutMin: 0,
+                zeroForOne: i % 2 == 0,
+                poolKey: poolKey,
+                hookData: abi.encode(makeAddr(string.concat("gasTrader", vm.toString(i)))),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+        }
+        // Still well before the deadline - only the size cap can trigger the next push.
+        assertLt(block.number, hook.batchDeadline(poolId));
+
+        uint256 gasBefore = gasleft();
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: poolKey,
+            hookData: abi.encode(makeAddr("gasTraderLast")),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        uint256 gasUsed = gasBefore - gasleft();
+
+        assertEq(hook.queueLength(poolId), 0, "cap must have force-settled the full batch");
+        // Well under a single block's gas limit (~30M on mainnet) even at the batch-size cap
+        // - the O(n^2) CLVR cost stays practical once batch size is bounded.
+        assertLt(gasUsed, 20_000_000, "settling a full-size batch must stay well under typical block gas limits");
+    }
+
+    // ---------------------------------------------------------------------
+    // CLVR ordering, fuzzed sort property
+    // ---------------------------------------------------------------------
+
+    /// @dev Fuzzed version of the paper's "same-direction batches execute smallest to
+    /// largest" claim (Section 5.7): for any three random same-direction amounts, CLVR's
+    /// actual execution order must match ascending sort order.
+    function testFuzz_CLVR_ThreeSameDirectionOrders_SortedAscending(uint256 a, uint256 b, uint256 c) public {
+        a = bound(a, 1e18, 30e18);
+        b = bound(b, 1e18, 30e18);
+        c = bound(c, 1e18, 30e18);
+        vm.assume(a != b && b != c && a != c);
+
+        (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
+        PoolId clvrPoolId = clvrPoolKey.toId();
+
+        address traderA = makeAddr("sortA");
+        address traderB = makeAddr("sortB");
+        address traderC = makeAddr("sortC");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: a,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(traderA),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: b,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(traderB),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: c,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: clvrPoolKey,
+            hookData: abi.encode(traderC),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        uint256[3] memory amounts = [a, b, c];
+        address[3] memory traders = [traderA, traderB, traderC];
+        for (uint256 i = 0; i < 3; i++) {
+            for (uint256 j = i + 1; j < 3; j++) {
+                if (amounts[j] < amounts[i]) {
+                    (amounts[i], amounts[j]) = (amounts[j], amounts[i]);
+                    (traders[i], traders[j]) = (traders[j], traders[i]);
+                }
+            }
+        }
+
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traders[0], true, amounts[0], 0);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traders[1], true, amounts[1], 1);
+        vm.expectEmit(true, true, false, true, address(clvrHook));
+        emit CadenceHook.OrderSettled(clvrPoolId, traders[2], true, amounts[2], 2);
+
+        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        clvrHook.settle(clvrPoolKey);
+    }
+
+    // ---------------------------------------------------------------------
+    // Reentrancy, distinct attack shape: nested settle() rather than nested swap()
+    // ---------------------------------------------------------------------
+
+    function _deploySettleReentrancyTestPool()
+        private
+        returns (CadenceHook srHook, PoolKey memory srPoolKey, MockERC20 goodToken, SettleReentrantToken badToken)
+    {
+        goodToken = new MockERC20("Good Token", "GOOD", 18);
+        badToken = new SettleReentrantToken("Settle Reentrant Token", "SRT", 18);
+
+        goodToken.mint(address(this), 10_000_000 ether);
+        badToken.mint(address(this), 10_000_000 ether);
+
+        goodToken.approve(address(permit2), type(uint256).max);
+        goodToken.approve(address(swapRouter), type(uint256).max);
+        permit2.approve(address(goodToken), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(goodToken), address(poolManager), type(uint160).max, type(uint48).max);
+
+        badToken.approve(address(permit2), type(uint256).max);
+        badToken.approve(address(swapRouter), type(uint256).max);
+        permit2.approve(address(badToken), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(badToken), address(poolManager), type(uint160).max, type(uint48).max);
+
+        (Currency srCurrency0, Currency srCurrency1) = address(goodToken) < address(badToken)
+            ? (Currency.wrap(address(goodToken)), Currency.wrap(address(badToken)))
+            : (Currency.wrap(address(badToken)), Currency.wrap(address(goodToken)));
+
+        address flags9 =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x9111 << 144));
+        bytes memory args9 = abi.encode(poolManager, uint256(1e18), BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE);
+        deployCodeTo("CadenceHook.sol:CadenceHook", args9, flags9);
+        srHook = CadenceHook(flags9);
+
+        srPoolKey = PoolKey(srCurrency0, srCurrency1, 3000, 60, IHooks(srHook));
+        poolManager.initialize(srPoolKey, Constants.SQRT_PRICE_1_1);
+
+        int24 tickLower = TickMath.minUsableTick(srPoolKey.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(srPoolKey.tickSpacing);
+        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            1000e18
+        );
+        positionManager.mint(
+            srPoolKey,
+            tickLower,
+            tickUpper,
+            1000e18,
+            amount0Expected + 1,
+            amount1Expected + 1,
+            address(this),
+            block.timestamp,
+            Constants.ZERO_BYTES
+        );
+
+        badToken.arm(ISettleCallable(address(srHook)), srPoolKey);
+    }
+
+    function testReentrancy_SettleCallAttemptedDuringSettlementIsRejected() public {
+        (CadenceHook srHook, PoolKey memory srPoolKey, MockERC20 goodToken, SettleReentrantToken badToken) =
+            _deploySettleReentrancyTestPool();
+        PoolId srPoolId = srPoolKey.toId();
+        bool badIsCurrency1 = Currency.unwrap(srPoolKey.currency1) == address(badToken);
+
+        address victim = makeAddr("settleReentrancyVictim");
+        address otherTrader = makeAddr("settleReentrancyOther");
+
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: badIsCurrency1,
+            poolKey: srPoolKey,
+            hookData: abi.encode(victim),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: !badIsCurrency1,
+            poolKey: srPoolKey,
+            hookData: abi.encode(otherTrader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(srHook.batchDeadline(srPoolId));
+        srHook.settle(srPoolKey);
+
+        assertTrue(badToken.reentryAttempted(), "malicious token should have attempted a nested settle() call");
+        assertTrue(
+            badToken.reentryReverted(),
+            "PoolManager's own AlreadyUnlocked guard must reject the nested unlock, independent of CadenceHook"
+        );
+
+        // The token catches its own reentrant attempt internally, so its transfer() still
+        // succeeds overall - the victim is paid normally, and so is the unrelated order.
+        assertEq(srHook.queueLength(srPoolId), 0);
+        assertGt(badToken.balanceOf(victim), 0, "victim should still receive their real payout");
+        assertGt(goodToken.balanceOf(otherTrader), 0, "the other queued order should settle normally too");
     }
 }
