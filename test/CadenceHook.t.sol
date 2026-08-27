@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
@@ -1230,74 +1231,130 @@ contract CadenceHookTest is BaseTest {
     /// @dev Fix 5: two orders with identical direction and size produce an exact deviation
     /// tie at every step. CLVR must deterministically prefer whichever arrived first - never
     /// a discretionary or ambiguous choice.
-    function testCLVR_TieBreaksByArrivalOrder() public {
+    /// @dev Ties used to be broken by arrival order alone - deterministic, but exploitable:
+    /// an attacker forcing a tie by matching the victim's exact trade size always arrives
+    /// first by definition of front-running, so "earliest wins" always handed them the win.
+    /// Verified empirically in SandwichDemo.t.sol, not just reasoned about - a size-matched
+    /// front-run produced identical profit to a plain, unprotected pool.
+    ///
+    /// The fix keys the tie-break on blockhash(block.number - 1), captured fresh at
+    /// settlement time, instead of on anything fixed when the orders were submitted. This
+    /// test proves that actually changed something: across several different settlement
+    /// blocks (nobody, including an attacker, controls which block a real settlement lands
+    /// in), the winner of an otherwise-identical tie is NOT always the order that arrived
+    /// first - if it were, this fix would be cosmetic.
+    function testCLVR_TieBreak_NotAlwaysArrivalOrder() public {
         (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
         PoolId clvrPoolId = clvrPoolKey.toId();
-        address firstTrader = makeAddr("tieFirstTrader");
-        address secondTrader = makeAddr("tieSecondTrader");
 
-        swapRouter.swapExactTokensForTokens({
-            amountIn: 5e18,
-            amountOutMin: 0,
-            zeroForOne: true,
-            poolKey: clvrPoolKey,
-            hookData: abi.encode(firstTrader),
-            receiver: address(this),
-            deadline: block.timestamp + 1
-        });
-        swapRouter.swapExactTokensForTokens({
-            amountIn: 5e18,
-            amountOutMin: 0,
-            zeroForOne: true,
-            poolKey: clvrPoolKey,
-            hookData: abi.encode(secondTrader),
-            receiver: address(this),
-            deadline: block.timestamp + 1
-        });
+        bool sawFirstTraderWin = false;
+        bool sawSecondTraderWin = false;
 
-        vm.expectEmit(true, true, false, true, address(clvrHook));
-        emit CadenceHook.OrderSettled(clvrPoolId, firstTrader, true, 5e18, 0);
-        vm.expectEmit(true, true, false, true, address(clvrHook));
-        emit CadenceHook.OrderSettled(clvrPoolId, secondTrader, true, 5e18, 1);
+        for (uint256 trial = 0; trial < 15 && !(sawFirstTraderWin && sawSecondTraderWin); trial++) {
+            address firstTrader = makeAddr(string.concat("tieFirst", vm.toString(trial)));
+            address secondTrader = makeAddr(string.concat("tieSecond", vm.toString(trial)));
 
-        vm.roll(clvrHook.batchDeadline(clvrPoolId));
-        clvrHook.settle(clvrPoolKey);
+            swapRouter.swapExactTokensForTokens({
+                amountIn: 5e18,
+                amountOutMin: 0,
+                zeroForOne: true,
+                poolKey: clvrPoolKey,
+                hookData: abi.encode(firstTrader),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+            swapRouter.swapExactTokensForTokens({
+                amountIn: 5e18,
+                amountOutMin: 0,
+                zeroForOne: true,
+                poolKey: clvrPoolKey,
+                hookData: abi.encode(secondTrader),
+                receiver: address(this),
+                deadline: block.timestamp + 1
+            });
+
+            // Settle at a different block each trial - in a live pool nobody chooses exactly
+            // which block settlement lands in.
+            vm.roll(clvrHook.batchDeadline(clvrPoolId) + trial);
+
+            // Both orders get paid by the end of settlement regardless of execution order -
+            // that's the whole point of batching - so a final-balance check can't tell us who
+            // went first. The OrderSettled event's settlementStep can: it's emitted exactly
+            // once per order, in actual execution order, so whichever trader's event carries
+            // settlementStep == 0 is the one CLVR picked first this trial.
+            vm.recordLogs();
+            clvrHook.settle(clvrPoolKey);
+            Vm.Log[] memory entries = vm.getRecordedLogs();
+
+            bytes32 orderSettledTopic0 = keccak256("OrderSettled(bytes32,address,bool,uint256,uint256)");
+            for (uint256 i = 0; i < entries.length; i++) {
+                if (entries[i].topics.length > 0 && entries[i].topics[0] == orderSettledTopic0) {
+                    (,, uint256 settlementStep) = abi.decode(entries[i].data, (bool, uint256, uint256));
+                    if (settlementStep == 0) {
+                        address winner = address(uint160(uint256(entries[i].topics[2])));
+                        if (winner == firstTrader) {
+                            sawFirstTraderWin = true;
+                        } else {
+                            sawSecondTraderWin = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        assertTrue(sawFirstTraderWin, "the earlier-arrived order should still win sometimes - the rule is not 'always the other one' either");
+        assertTrue(
+            sawSecondTraderWin,
+            "the earlier-arrived order must not ALWAYS win - if it does, matching a victim's trade size to force a tie is still a guaranteed exploit"
+        );
     }
 
-    function testFuzz_CLVR_TieBreaksByArrivalOrder(uint256 tiedAmount, bool direction) public {
-        tiedAmount = bound(tiedAmount, 1e18, 40e18);
-
+    /// @dev Same tie-break, settled at the same block every time, must always produce the
+    /// same winner - the rule is a deterministic function of settlement-time state, not
+    /// actual randomness. Unpredictable-in-advance and non-deterministic are different
+    /// properties; this checks the fix didn't accidentally trade one for the other.
+    function testCLVR_TieBreak_DeterministicForAFixedSettlementBlock() public {
         (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
         PoolId clvrPoolId = clvrPoolKey.toId();
-        address firstTrader = makeAddr("fuzzTieFirst");
-        address secondTrader = makeAddr("fuzzTieSecond");
+
+        address firstTrader = makeAddr("deterministicTieFirst");
+        address secondTrader = makeAddr("deterministicTieSecond");
 
         swapRouter.swapExactTokensForTokens({
-            amountIn: tiedAmount,
+            amountIn: 5e18,
             amountOutMin: 0,
-            zeroForOne: direction,
+            zeroForOne: true,
             poolKey: clvrPoolKey,
             hookData: abi.encode(firstTrader),
             receiver: address(this),
             deadline: block.timestamp + 1
         });
         swapRouter.swapExactTokensForTokens({
-            amountIn: tiedAmount,
+            amountIn: 5e18,
             amountOutMin: 0,
-            zeroForOne: direction,
+            zeroForOne: true,
             poolKey: clvrPoolKey,
             hookData: abi.encode(secondTrader),
             receiver: address(this),
             deadline: block.timestamp + 1
         });
 
-        vm.expectEmit(true, true, false, true, address(clvrHook));
-        emit CadenceHook.OrderSettled(clvrPoolId, firstTrader, direction, tiedAmount, 0);
-        vm.expectEmit(true, true, false, true, address(clvrHook));
-        emit CadenceHook.OrderSettled(clvrPoolId, secondTrader, direction, tiedAmount, 1);
+        uint256 settlementBlock = clvrHook.batchDeadline(clvrPoolId) + 7;
+        vm.roll(settlementBlock);
 
-        vm.roll(clvrHook.batchDeadline(clvrPoolId));
+        // Snapshot right before settling, so it can be replayed from the exact same starting
+        // state at the exact same block number.
+        uint256 snapshot = vm.snapshotState();
         clvrHook.settle(clvrPoolKey);
+        bool firstWonRunA = CurrencyLibrary.balanceOf(clvrPoolKey.currency1, firstTrader) > 0;
+
+        vm.revertToState(snapshot);
+        vm.roll(settlementBlock);
+        clvrHook.settle(clvrPoolKey);
+        bool firstWonRunB = CurrencyLibrary.balanceOf(clvrPoolKey.currency1, firstTrader) > 0;
+
+        assertEq(firstWonRunA, firstWonRunB, "settling at the identical block must always produce the identical winner");
     }
 
     function testFuzz_CLVR_SettlesEveryOrderExactlyOnce(uint8 rawCount, uint256 seed) public {

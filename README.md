@@ -198,8 +198,8 @@ Five concrete failure modes were identified and closed. Each has real precedent 
 <tr><td>5️⃣</td><td>
 
 **CLVR ordering ambiguity**
-**Risk:** if two valid orderings of a batch score identically, there's theoretical room for discretion in which one is chosen.
-**Fix:** an explicit, deterministic tie-breaking rule (e.g. resolve by original submission order) — no party, including the contract itself, ever makes a discretionary choice between equally-valid outcomes.
+**Risk:** if two valid orderings of a batch score identically, there's theoretical room for discretion in which one is chosen — and this isn't just theoretical: our first tie-break rule resolved ties by order of arrival, which is deterministic but exploitable, since an attacker can force a tie against a victim simply by submitting a trade of the identical size, and front-running means arriving first by definition. Verified empirically: a size-matched front-run produced profit numerically identical to an unprotected pool.
+**Fix:** the tie-break now keys on the settlement block's own hash, captured fresh when settlement runs rather than fixed at order-submission time — still fully deterministic and checkable after the fact, but no longer predictable in advance by whoever is deciding whether to attempt the attack. Stated honestly: this converts a *guaranteed* exploit into an *unreliable* one for this exact-size-match case, not a fully eliminated one — the outcome now genuinely varies by settlement block, including landing the attacker at a loss, but chance can still occasionally favor them.
 
 </td></tr>
 </table>
@@ -236,10 +236,10 @@ Batching as a general approach to MEV protection is **not a novel category** —
 
 The core proof is **live, not descriptive**. The same three transactions — front-run, victim swap, back-run — are executed twice, side by side:
 
-1. 🔴 **Against a plain Uniswap v4 pool:** the attacker's wallet balance increases; the victim receives a worse price than quoted.
-2. 🟢 **Against a Cadence-enabled pool:** the identical three transactions produce **zero attacker profit**; the victim receives the fair, batch-cleared price.
+1. 🔴 **Against a plain Uniswap v4 pool:** the attacker's wallet balance increases, every single time — this is deterministic and guaranteed, not probabilistic.
+2. 🟢 **Against a Cadence-enabled pool:** the identical three transactions no longer guarantee the attacker anything. Batching removes the mechanical precondition the plain-pool attack depends on outright. We also stress-tested the hardest case we could construct — an attacker sizing their front-run to exactly match the victim's trade — and found it initially still worked, due to a tie-breaking gap we found, fixed, and verified: with the fix, that same worst case now produces a genuinely varying outcome across possible settlement blocks, including the attacker landing at an outright **loss**, rather than the guaranteed profit a plain pool always hands them.
 
-Two on-chain transaction receipts, side by side. No slide required to make the claim credible.
+Two on-chain transaction receipts, side by side. No slide required to make the claim credible — including for the failure mode we found while building it.
 
 ---
 

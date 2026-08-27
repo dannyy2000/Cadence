@@ -307,6 +307,15 @@ contract CadenceHook is BaseHook, IHookEvents {
     /// outside party — there's no gap between them for anyone to insert into. CLVR is what
     /// additionally makes the *internal* order fair, instead of leaving it as an arbitrary
     /// array order the way the earlier placeholder did.
+    struct SettlementContext {
+        uint160 referenceSqrtPriceX96;
+        uint24 lpFee;
+        // Tie-break entropy, captured once per settlement from the previous block's hash -
+        // NOT from anything fixed at order-submission time. See _tieBreakKey's doc comment
+        // for why arrival order alone is exploitable and this isn't just a style choice.
+        bytes32 tieBreakEntropy;
+    }
+
     function _settle(PoolId poolId, PoolKey memory key) internal {
         QueuedOrder[] memory orders = _batchQueue[poolId];
         uint256 n = orders.length;
@@ -316,6 +325,8 @@ contract CadenceHook is BaseHook, IHookEvents {
         }
 
         (uint160 referenceSqrtPriceX96,,, uint24 lpFee) = poolManager.getSlot0(poolId);
+        SettlementContext memory ctx =
+            SettlementContext({referenceSqrtPriceX96: referenceSqrtPriceX96, lpFee: lpFee, tieBreakEntropy: blockhash(block.number - 1)});
 
         bool[] memory settled = new bool[](n);
 
@@ -326,6 +337,7 @@ contract CadenceHook is BaseHook, IHookEvents {
 
             uint256 bestIndex = type(uint256).max;
             uint256 bestDeviation = type(uint256).max;
+            uint256 bestTieBreakKey = type(uint256).max;
 
             // Simulate every not-yet-executed order against the current (real, just-read)
             // pool state - a pure math projection via the same step function the pool itself
@@ -334,24 +346,14 @@ contract CadenceHook is BaseHook, IHookEvents {
             for (uint256 j = 0; j < n; j++) {
                 if (settled[j]) continue;
 
-                QueuedOrder memory candidate = orders[j];
-                uint160 sqrtPriceTargetX96 =
-                    candidate.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+                (uint256 deviation, uint256 tieBreakKey) =
+                    _evaluateCandidate(orders[j], currentSqrtPriceX96, liquidity, ctx, j);
 
-                (uint160 resultingSqrtPriceX96,,,) = SwapMath.computeSwapStep(
-                    currentSqrtPriceX96, sqrtPriceTargetX96, liquidity, -int256(candidate.amountIn), lpFee
-                );
-
-                uint256 deviation = _deviationFromReference(referenceSqrtPriceX96, resultingSqrtPriceX96);
-                // Strictly-less-than only: on an exact tie between two candidates, the
-                // earlier one (lower j, i.e. whichever arrived at the queue first) keeps
-                // `bestIndex` rather than being overwritten. Since `j` is scanned in a fixed,
-                // deterministic order every time, this makes tie-breaking deterministic by
-                // original submission order with no extra state or explicit rule needed - no
-                // party, including the contract itself, ever makes a discretionary choice
-                // between equally-valid orderings.
-                if (deviation < bestDeviation) {
+                // On an exact deviation tie, the smaller tie-break key wins instead of the
+                // smaller j (arrival order). See _tieBreakKey for why.
+                if (deviation < bestDeviation || (deviation == bestDeviation && tieBreakKey < bestTieBreakKey)) {
                     bestDeviation = deviation;
+                    bestTieBreakKey = tieBreakKey;
                     bestIndex = j;
                 }
             }
@@ -378,6 +380,55 @@ contract CadenceHook is BaseHook, IHookEvents {
         batchDeadline[poolId] = 0;
 
         emit BatchSettled(poolId, n);
+    }
+
+    /// @dev Fix 5, tie-break rule. An earlier version of this used plain arrival order (lower
+    /// queue index wins ties) - deterministic and free of discretionary choice, which was the
+    /// original goal, but it turned out to be exploitable: an attacker can force an exact
+    /// deviation tie against a victim simply by submitting a trade of the identical size and
+    /// direction, and since front-running means arriving first by definition, arrival-order
+    /// tie-breaking handed that tie to the attacker every single time. Verified empirically,
+    /// not just reasoned about - see SandwichDemo.t.sol.
+    ///
+    /// The fix: key the tie-break on `blockhash(block.number - 1)`, captured once per
+    /// settlement, instead of on anything fixed at order-submission time. This keeps the rule
+    /// itself fully deterministic and checkable after the fact (same inputs always produce
+    /// the same winner, and no party - not the contract, not whoever triggers settlement -
+    /// chooses it), while making the *outcome* impossible to know in advance: an attacker
+    /// deciding whether to submit a size-matching front-run cannot know what
+    /// blockhash(block.number - 1) will be at settlement time, because that block hasn't been
+    /// mined yet. Deterministic and unpredictable-in-advance are different properties: the
+    /// old rule had only the first, this has both.
+    ///
+    /// Honest residual limitation: blockhash is only available for the most recent 256
+    /// blocks, and reads as 0 beyond that. On a batch left overdue that long - itself an edge
+    /// case the fallback settlement trigger exists specifically to keep rare - the tie-break
+    /// would degrade to a fixed, no-longer-unpredictable function of queue position. A more
+    /// resourced adversary who could also control exactly which block settlement lands in
+    /// (e.g. grinding the fallback trigger on an otherwise-quiet pool) could attempt limited
+    /// manipulation - the same caveat that applies to blockhash-based mechanisms across
+    /// Ethereum generally, and a meaningfully more expensive attack than the one this closes.
+    function _tieBreakKey(bytes32 entropy, uint256 queueIndex) internal pure returns (uint256) {
+        return uint256(keccak256(abi.encode(entropy, queueIndex)));
+    }
+
+    /// @dev Factored out of `_settle`'s selection loop purely to keep that function's local
+    /// variable count under Solidity's stack-depth limit - no behavior change from inlining.
+    function _evaluateCandidate(
+        QueuedOrder memory candidate,
+        uint160 currentSqrtPriceX96,
+        uint128 liquidity,
+        SettlementContext memory ctx,
+        uint256 queueIndex
+    ) private pure returns (uint256 deviation, uint256 tieBreakKey) {
+        uint160 sqrtPriceTargetX96 = candidate.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+
+        (uint160 resultingSqrtPriceX96,,,) = SwapMath.computeSwapStep(
+            currentSqrtPriceX96, sqrtPriceTargetX96, liquidity, -int256(candidate.amountIn), ctx.lpFee
+        );
+
+        deviation = _deviationFromReference(ctx.referenceSqrtPriceX96, resultingSqrtPriceX96);
+        tieBreakKey = _tieBreakKey(ctx.tieBreakEntropy, queueIndex);
     }
 
     /// @dev Executes one order's swap and pays out its output. External (rather than
