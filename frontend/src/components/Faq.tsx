@@ -15,7 +15,11 @@ const faqs = [
   },
   {
     q: "What is CLVR, and why not just process the queue in the order trades arrived?",
-    a: "Processing strictly in arrival order would just move the exploitable 'before/after' gap inside the batch instead of removing it. CLVR is an academic ordering rule that instead picks whichever order keeps every trade's price closest to fair market value — proven to eliminate the classic 3-transaction sandwich pattern.",
+    a: "Processing strictly in arrival order would just move the exploitable 'before/after' gap inside the batch instead of removing it. CLVR is an academic ordering rule that instead picks whichever order keeps every trade's price closest to fair market value — proven to eliminate the classic 3-transaction sandwich pattern. We also found a gap the paper's own analysis doesn't cover (an attacker matching a victim's trade size exactly) and closed it ourselves: exactly-matched trades are now merged into one settlement instead of sequenced, rather than left as an edge case.",
+  },
+  {
+    q: 'Does that mean an attacker can never profit at all?',
+    a: "No, and we're not going to claim otherwise. What's fully closed and provable is the ordering exploit — an attacker can no longer win by gaming execution order, verified identical across every settlement scenario we tested. What isn't closed is a separate, older problem called Loss-Versus-Rebalancing: profit from trading around a price move that a large trade itself caused. That exists on every AMM, batched or not, and nobody has solved it — including us. See The Proof section above for the real numbers on both.",
   },
   {
     q: 'Does this slow down everyday trading?',

@@ -1,8 +1,7 @@
 // Real, verified figures from test/SandwichDemo.t.sol - not illustrative placeholders.
 // Reproduce with: forge test --match-contract SandwichDemoTest -vv
 const PLAIN_POOL_PROFIT = 4417.78
-const CADENCE_TRIAL_LUCKY = 4417.78
-const CADENCE_TRIAL_UNLUCKY = -292.79
+const CADENCE_MERGED_PROFIT = 2067.79
 
 function formatSigned(value: number): string {
   const sign = value > 0 ? '+' : value < 0 ? '−' : ''
@@ -34,33 +33,26 @@ export function Proof() {
             </p>
           </div>
 
-          <div className="proof-card proof-card-good">
+          <div className="proof-card proof-card-partial">
             <span className="proof-card-label">Cadence-enabled pool</span>
-            <div className="proof-card-split">
-              <div>
-                <span className="proof-card-value mono">{formatSigned(CADENCE_TRIAL_LUCKY)}</span>
-                <span className="proof-split-caption">one real trial</span>
-              </div>
-              <div>
-                <span className="proof-card-value mono proof-value-negative">
-                  {formatSigned(CADENCE_TRIAL_UNLUCKY)}
-                </span>
-                <span className="proof-split-caption">another real trial</span>
-              </div>
-            </div>
-            <span className="proof-card-unit">attacker profit, token1</span>
+            <span className="proof-card-value mono">{formatSigned(CADENCE_MERGED_PROFIT)}</span>
+            <span className="proof-card-unit">attacker profit, token1 — identical across all 12 settlement blocks tested</span>
             <p className="proof-card-note">
-              No longer reliable. The outcome depends on which block settlement happens to
-              land in — something nobody, including the attacker, controls in advance. Same
-              attack, same sizes: sometimes a profit, sometimes an outright loss.
+              Roughly half the plain pool's profit, and no longer a matter of luck. We tried an
+              unpredictable tie-break first — checking the real expected value showed it still
+              favored the attacker on average, so we replaced it: exactly-matched trades are now
+              merged into one combined settlement instead of executed in sequence, closing the
+              ordering exploit completely rather than just making it unreliable.
             </p>
           </div>
         </div>
 
-        <p className="verdict verdict-success">
-          We're not claiming a guaranteed zero — we're honest that it's a coin flip the
-          attacker can no longer call in advance. Turning a certainty into a gamble is what
-          actually stops it from being worth attacking at scale.
+        <p className="verdict verdict-warn">
+          We're not rounding this up to zero. The remaining profit isn't an ordering exploit —
+          it's Loss-Versus-Rebalancing, a distinct, published, unsolved problem that exists on
+          every AMM regardless of settlement design. What we can prove, not just claim: the
+          specific exploit we set out to close — winning by gaming execution order — is closed,
+          verified identical across every settlement block we tested.
         </p>
 
         <p className="proof-repro">

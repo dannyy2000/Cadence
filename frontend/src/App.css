@@ -77,6 +77,12 @@ section {
   border-color: rgba(52, 211, 153, 0.25);
 }
 
+.verdict-warn {
+  background: var(--color-warn-soft);
+  color: var(--color-warn);
+  border-color: rgba(245, 185, 66, 0.25);
+}
+
 /* ---------- Proof ---------- */
 
 .proof-grid {
@@ -111,6 +117,15 @@ section {
 .proof-card-good {
   border-color: rgba(52, 211, 153, 0.25);
   background: linear-gradient(180deg, var(--color-success-soft), var(--color-bg-raised) 60%);
+}
+
+.proof-card-partial {
+  border-color: rgba(245, 185, 66, 0.25);
+  background: linear-gradient(180deg, var(--color-warn-soft), var(--color-bg-raised) 60%);
+}
+
+.proof-card-partial .proof-card-value {
+  color: var(--color-warn);
 }
 
 .proof-card-label {

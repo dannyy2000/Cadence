@@ -1237,22 +1237,27 @@ contract CadenceHookTest is BaseTest {
     /// Verified empirically in SandwichDemo.t.sol, not just reasoned about - a size-matched
     /// front-run produced identical profit to a plain, unprotected pool.
     ///
-    /// The fix keys the tie-break on blockhash(block.number - 1), captured fresh at
-    /// settlement time, instead of on anything fixed when the orders were submitted. This
-    /// test proves that actually changed something: across several different settlement
-    /// blocks (nobody, including an attacker, controls which block a real settlement lands
-    /// in), the winner of an otherwise-identical tie is NOT always the order that arrived
-    /// first - if it were, this fix would be cosmetic.
-    function testCLVR_TieBreak_NotAlwaysArrivalOrder() public {
+    /// Superseded finding, kept here for the history: an earlier version of this fix keyed
+    /// the tie-break on blockhash(block.number - 1) so the winner of an exact tie wasn't
+    /// predictable at submission time. That was real progress (proven: the winner genuinely
+    /// varied across settlement blocks) but not the actual fix - checking the real expected
+    /// value across outcomes (see SandwichDemo.t.sol) showed an unpredictable-per-attempt
+    /// coin flip is still strongly profitable on average, since "can't be predicted in
+    /// advance" and "not worth attempting" are different properties.
+    ///
+    /// The actual fix removes the coin flip instead of just making it fair: two or more
+    /// exactly-tied orders (identical amountIn and direction) are merged into one combined
+    /// settlement instead of executed in sequence, so there is no "winner" of the tie to
+    /// pick at all. This test proves that: across many different settlement blocks, both
+    /// tied traders settle at the *same* settlementStep every single time - not sometimes
+    /// one first and sometimes the other, but never separated into a first/second at all.
+    function testCLVR_ExactTie_AlwaysMergesRegardlessOfSettlementBlock() public {
         (CadenceHook clvrHook, PoolKey memory clvrPoolKey) = _deployClvrTestPool();
         PoolId clvrPoolId = clvrPoolKey.toId();
 
-        bool sawFirstTraderWin = false;
-        bool sawSecondTraderWin = false;
-
-        for (uint256 trial = 0; trial < 15 && !(sawFirstTraderWin && sawSecondTraderWin); trial++) {
-            address firstTrader = makeAddr(string.concat("tieFirst", vm.toString(trial)));
-            address secondTrader = makeAddr(string.concat("tieSecond", vm.toString(trial)));
+        for (uint256 trial = 0; trial < 8; trial++) {
+            address firstTrader = makeAddr(string.concat("mergeTieFirst", vm.toString(trial)));
+            address secondTrader = makeAddr(string.concat("mergeTieSecond", vm.toString(trial)));
 
             swapRouter.swapExactTokensForTokens({
                 amountIn: 5e18,
@@ -1273,41 +1278,34 @@ contract CadenceHookTest is BaseTest {
                 deadline: block.timestamp + 1
             });
 
-            // Settle at a different block each trial - in a live pool nobody chooses exactly
-            // which block settlement lands in.
+            // A different settlement block each trial - in a live pool nobody chooses
+            // exactly which block settlement lands in.
             vm.roll(clvrHook.batchDeadline(clvrPoolId) + trial);
 
-            // Both orders get paid by the end of settlement regardless of execution order -
-            // that's the whole point of batching - so a final-balance check can't tell us who
-            // went first. The OrderSettled event's settlementStep can: it's emitted exactly
-            // once per order, in actual execution order, so whichever trader's event carries
-            // settlementStep == 0 is the one CLVR picked first this trial.
             vm.recordLogs();
             clvrHook.settle(clvrPoolKey);
             Vm.Log[] memory entries = vm.getRecordedLogs();
 
             bytes32 orderSettledTopic0 = keccak256("OrderSettled(bytes32,address,bool,uint256,uint256)");
+            uint256 firstTraderStep = type(uint256).max;
+            uint256 secondTraderStep = type(uint256).max;
             for (uint256 i = 0; i < entries.length; i++) {
-                if (entries[i].topics.length > 0 && entries[i].topics[0] == orderSettledTopic0) {
-                    (,, uint256 settlementStep) = abi.decode(entries[i].data, (bool, uint256, uint256));
-                    if (settlementStep == 0) {
-                        address winner = address(uint160(uint256(entries[i].topics[2])));
-                        if (winner == firstTrader) {
-                            sawFirstTraderWin = true;
-                        } else {
-                            sawSecondTraderWin = true;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+                if (entries[i].topics.length == 0 || entries[i].topics[0] != orderSettledTopic0) continue;
 
-        assertTrue(sawFirstTraderWin, "the earlier-arrived order should still win sometimes - the rule is not 'always the other one' either");
-        assertTrue(
-            sawSecondTraderWin,
-            "the earlier-arrived order must not ALWAYS win - if it does, matching a victim's trade size to force a tie is still a guaranteed exploit"
-        );
+                (,, uint256 settlementStep) = abi.decode(entries[i].data, (bool, uint256, uint256));
+                address trader = address(uint160(uint256(entries[i].topics[2])));
+                if (trader == firstTrader) firstTraderStep = settlementStep;
+                if (trader == secondTrader) secondTraderStep = settlementStep;
+            }
+
+            assertTrue(firstTraderStep != type(uint256).max, "first trader must have settled");
+            assertTrue(secondTraderStep != type(uint256).max, "second trader must have settled");
+            assertEq(
+                firstTraderStep,
+                secondTraderStep,
+                "an exact tie must merge - both traders settling at the same step, every trial, regardless of block"
+            );
+        }
     }
 
     /// @dev Same tie-break, settled at the same block every time, must always produce the

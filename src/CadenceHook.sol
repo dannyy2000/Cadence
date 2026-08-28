@@ -358,8 +358,63 @@ contract CadenceHook is BaseHook, IHookEvents {
                 }
             }
 
+            // A merge in a prior iteration of this same loop can settle more than one order
+            // at once (see below), so the queue can run out before `step` reaches `n - 1`.
+            // Without this check, finding no remaining candidate would leave `bestIndex` at
+            // its sentinel value and the array read just below would revert out-of-bounds.
+            if (bestIndex == type(uint256).max) break;
+
             QueuedOrder memory winner = orders[bestIndex];
-            settled[bestIndex] = true;
+
+            _settleTieGroup(poolId, key, orders, settled, winner, step);
+        }
+        _settling = false;
+
+        delete _batchQueue[poolId];
+        batchDeadline[poolId] = 0;
+
+        emit BatchSettled(poolId, n);
+    }
+
+    /// @dev Finds every remaining order tied exactly with `winner` (identical amountIn and
+    /// direction - which deterministically means identical price impact, not a coincidental
+    /// tie, since the swap-impact math is a pure function of those two fields plus current
+    /// state) and settles the whole group as one unit: a solo winner takes the existing
+    /// single-order path, two or more get merged into one combined swap with the output split
+    /// pro-rata instead of executed in an arbitrary sequence.
+    ///
+    /// Picking one order over another to go first - even unpredictably, per the tie-break in
+    /// `_settle` - still hands whoever goes first a marginally better position than whoever
+    /// goes second, because they'd still execute in sequence. Verified this actually matters,
+    /// not just reasoned about it: see SandwichDemo.t.sol, where an attacker who forces this
+    /// exact tie against a victim nets strongly positive expected value across outcomes
+    /// despite the tie-break being unpredictable per individual attempt - "can't be predicted
+    /// in advance" and "not worth attempting" are different properties, and only the second
+    /// one actually closes the exploit. Merging removes the sequence entirely for tied orders
+    /// instead of just making its outcome unpredictable.
+    ///
+    /// Split into its own function (rather than inlined in `_settle`'s loop) purely to keep
+    /// that loop's local-variable count under Solidity's stack-depth limit.
+    function _settleTieGroup(
+        PoolId poolId,
+        PoolKey memory key,
+        QueuedOrder[] memory orders,
+        bool[] memory settled,
+        QueuedOrder memory winner,
+        uint256 step
+    ) private {
+        uint256 n = orders.length;
+        uint256[] memory tieGroup = new uint256[](n);
+        uint256 tieGroupSize = 0;
+        for (uint256 j = 0; j < n; j++) {
+            if (settled[j]) continue;
+            if (orders[j].amountIn == winner.amountIn && orders[j].zeroForOne == winner.zeroForOne) {
+                tieGroup[tieGroupSize++] = j;
+            }
+        }
+
+        if (tieGroupSize == 1) {
+            settled[tieGroup[0]] = true;
 
             // One malformed or now-infeasible order (e.g. a payout currency that blacklists
             // its recipient, or reverts for its own reasons) must not revert the whole
@@ -373,13 +428,64 @@ contract CadenceHook is BaseHook, IHookEvents {
                 _refundOrder(key, winner);
                 emit OrderSkipped(poolId, winner.trader, winner.zeroForOne, winner.amountIn, step);
             }
+            return;
         }
-        _settling = false;
 
-        delete _batchQueue[poolId];
-        batchDeadline[poolId] = 0;
+        for (uint256 g = 0; g < tieGroupSize; g++) {
+            settled[tieGroup[g]] = true;
+        }
 
-        emit BatchSettled(poolId, n);
+        _settleMergedGroup(poolId, key, orders, tieGroup, tieGroupSize, winner, step);
+    }
+
+    /// @dev The merge path for a tie group of size 2+: one combined swap for the group's
+    /// summed input, then each member paid their pro-rata share independently. Split out of
+    /// `_settleTieGroup` purely to keep that function's (and this one's) local-variable count
+    /// under Solidity's stack-depth limit.
+    function _settleMergedGroup(
+        PoolId poolId,
+        PoolKey memory key,
+        QueuedOrder[] memory orders,
+        uint256[] memory tieGroup,
+        uint256 tieGroupSize,
+        QueuedOrder memory winner,
+        uint256 step
+    ) private {
+        uint256 totalAmount = winner.amountIn * tieGroupSize;
+
+        try this._executeMergeSwap(key, winner.zeroForOne, totalAmount) returns (uint256 outputAmount) {
+            uint256 distributed = 0;
+            for (uint256 g = 0; g < tieGroupSize; g++) {
+                QueuedOrder memory member = orders[tieGroup[g]];
+                // Equal contributions (every member in a tie group shares the same amountIn
+                // by construction) split the output evenly; the last member absorbs the
+                // integer-division remainder so every wei is accounted for rather than left
+                // stranded in the hook.
+                uint256 share = (g == tieGroupSize - 1) ? (outputAmount - distributed) : outputAmount / tieGroupSize;
+                distributed += share;
+
+                try this._payMergedShare(key, winner.zeroForOne, member.trader, share) {
+                    emit OrderSettled(poolId, member.trader, member.zeroForOne, member.amountIn, step);
+                } catch {
+                    // The combined swap already happened and can't be selectively unwound for
+                    // just one member, so their original input can't be handed back the way a
+                    // solo order's can. Fall back to minting this member's rightful share as
+                    // ERC-6909 claim tokens instead of a real transfer - ordinary Uniswap
+                    // accounting, always mintable, no external call to a potentially
+                    // malicious token - so one bad recipient can't strand value that's
+                    // already been swapped, or block the other members' real payouts.
+                    Currency mergedOutput = winner.zeroForOne ? key.currency1 : key.currency0;
+                    mergedOutput.take(poolManager, member.trader, share, true);
+                    emit OrderSkipped(poolId, member.trader, member.zeroForOne, member.amountIn, step);
+                }
+            }
+        } catch {
+            for (uint256 g = 0; g < tieGroupSize; g++) {
+                QueuedOrder memory member = orders[tieGroup[g]];
+                _refundOrder(key, member);
+                emit OrderSkipped(poolId, member.trader, member.zeroForOne, member.amountIn, step);
+            }
+        }
     }
 
     /// @dev Fix 5, tie-break rule. An earlier version of this used plain arrival order (lower
@@ -459,6 +565,41 @@ contract CadenceHook is BaseHook, IHookEvents {
         uint256 outputAmount =
             order.zeroForOne ? uint256(int256(delta.amount1())) : uint256(int256(delta.amount0()));
         output.take(poolManager, order.trader, outputAmount, false);
+    }
+
+    /// @dev Executes one combined swap for a whole tie group's summed input, without paying
+    /// anyone yet - `_settle` distributes the output to each member separately via
+    /// `_payMergedShare`, each with its own fault isolation, once this succeeds. External and
+    /// self-call-only for the same reason as `_executeOrder`: try/catch needs an external call.
+    function _executeMergeSwap(PoolKey calldata key, bool zeroForOne, uint256 totalAmountIn)
+        external
+        returns (uint256 outputAmount)
+    {
+        if (msg.sender != address(this)) revert OnlySelf();
+
+        BalanceDelta delta = poolManager.swap(
+            key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(totalAmountIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            bytes("")
+        );
+
+        Currency input = zeroForOne ? key.currency0 : key.currency1;
+        input.settle(poolManager, address(this), totalAmountIn, true);
+
+        outputAmount = zeroForOne ? uint256(int256(delta.amount1())) : uint256(int256(delta.amount0()));
+    }
+
+    /// @dev Pays one merged-group member's pro-rata share of an already-executed combined
+    /// swap. Split out from `_executeMergeSwap` specifically so each member's payout can fail
+    /// independently without affecting the others or re-running the swap.
+    function _payMergedShare(PoolKey calldata key, bool zeroForOne, address trader, uint256 shareAmount) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        Currency output = zeroForOne ? key.currency1 : key.currency0;
+        output.take(poolManager, trader, shareAmount, false);
     }
 
     /// @dev Gives back exactly the input custody an order took at queue time, in its
