@@ -38,11 +38,9 @@ export function Proof() {
             <span className="proof-card-value mono">{formatSigned(CADENCE_MERGED_PROFIT)}</span>
             <span className="proof-card-unit">attacker profit, token1 — identical across all 12 settlement blocks tested</span>
             <p className="proof-card-note">
-              Roughly half the plain pool's profit, and no longer a matter of luck. We tried an
-              unpredictable tie-break first — checking the real expected value showed it still
-              favored the attacker on average, so we replaced it: exactly-matched trades are now
-              merged into one combined settlement instead of executed in sequence, closing the
-              ordering exploit completely rather than just making it unreliable.
+              Roughly half the plain pool's profit, and no longer a matter of luck. Trades that
+              tie exactly are settled together as one combined trade instead of one after the
+              other, so there's no "first" or "second" position left for either side to win.
             </p>
           </div>
         </div>
