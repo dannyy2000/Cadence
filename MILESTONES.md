@@ -72,6 +72,31 @@ of building on the first.
 
 ---
 
+## Testnet deployment (Unichain Sepolia, chain 1301)
+
+Live deployment the frontend's `.env.local` points at:
+
+| Contract | Address |
+|---|---|
+| `CadenceHook` | `0xaf6214dd1f38f63f9d8e5e3f28fedcb3afafc088` |
+| Currency0 (CTA) | `0x7189f430d8956100b2fec8735441e5da1509ae2a` |
+| Currency1 (CTB) | `0xd2de51eb438c77e4b719e82ac32a82144632d383` |
+
+Unichain Sepolia already has canonical `PoolManager`/`PositionManager`/`SwapRouter`
+deployments (resolved automatically via `hookmate`'s `AddressConstants`) — the local deploy
+sequence's step 2 (`00_DeployV4.s.sol`) isn't needed here. To reproduce: fund a deployer
+address with Unichain Sepolia ETH (faucets: [Uniswap's
+directory](https://developers.uniswap.org/docs/unichain/tools/faucets),
+[QuickNode](https://faucet.quicknode.com/unichain/sepolia)), put its private key in a
+gitignored `.env` at the repo root (`PRIVATE_KEY=...`), then run the same `00_DeployHook.s.sol`
+→ `01_CreatePoolAndAddLiquidity.s.sol` → (optional) `03_Swap.s.sol` sequence from the local
+steps above, with `--rpc-url https://sepolia.unichain.org` in place of the anvil URL and
+`--private-key "$PRIVATE_KEY"` in place of anvil's default key. The public RPC occasionally
+errors on the first attempt with a transient "non-archive node" fork error — a plain retry of
+the same command has resolved it both times we hit it.
+
+---
+
 ## Milestone 2 — due week two
 
 Contracts:
@@ -88,8 +113,9 @@ Contracts:
 
 Frontend:
 - [ ] Trade submission form wired to the hook
-- [ ] Live batch visualization (orders joining, deadline countdown, settlement firing)
-- [ ] Wallet connect, deployed to public testnet
+- [ ] Live batch visualization (orders joining, deadline countdown, settlement firing) — dashboard already shows queue size/deadline countdown from M1; still needs a real-time "order just joined" transition, not just polling snapshots
+- [ ] Wallet connect
+- [x] Deployed to public testnet — Unichain Sepolia (chain 1301), using the network's canonical PoolManager/PositionManager/SwapRouter (no redeployment needed there - `BaseScript`/`Deployers.sol` already resolved them via `AddressConstants`). Deployed `CadenceHook` at `0xaf6214dd1f38f63f9d8e5e3f28fedcb3afafc088`, a fresh CTA/CTB test pool, and submitted a real above-threshold swap - confirmed it actually joined the queue on-chain (`queueLength` went 0 → 1), not just that the transaction succeeded. Frontend `.env.local` now points at this deployment. One fix needed along the way: `ensureCurrencies()`/the constructor's currency setup only deployed fresh test tokens on chain 31337 - extended to also cover Unichain Sepolia (`_usesFreshTestTokens()`), since the template's hardcoded placeholder token addresses don't exist there.
 
 ---
 

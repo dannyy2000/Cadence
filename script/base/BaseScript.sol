@@ -23,11 +23,23 @@ contract BaseScript is Script, Deployers {
     /////////////////////////////////////
     // --- Configure These ---
     /////////////////////////////////////
-    // Only used on non-local chains; on chain 31337 (anvil) fresh mock tokens are deployed
-    // and minted to the deployer instead, since these placeholders won't have code there.
+    // Only used on chains where _usesFreshTestTokens() is false; on local anvil and on
+    // testnets we control (Unichain Sepolia included), fresh mock tokens are deployed and
+    // minted to the deployer instead, since these placeholders generally won't have code -
+    // or a funded balance for this deployer - on a real chain.
     IERC20 internal constant token0 = IERC20(0x0165878A594ca255338adfa4d48449f69242Eb8F);
     IERC20 internal constant token1 = IERC20(0xa513E6E4b8f2a923D98304ec87F64353C4D5C853);
     /////////////////////////////////////
+
+    /// @dev Chains where these scripts deploy their own fresh MockERC20 pair instead of using
+    /// the token0/token1 placeholders above - local anvil, plus real testnets we control and
+    /// want full mint control on rather than depending on some other faucet's token/liquidity.
+    /// Deliberately an allowlist, not "any non-mainnet chain": silently deploying throwaway
+    /// mock tokens is the wrong default to fall into on a chain this wasn't reviewed for.
+    function _usesFreshTestTokens() internal view returns (bool) {
+        return block.chainid == 31337 // anvil
+            || block.chainid == 1301; // Unichain Sepolia
+    }
 
     // Set via the HOOK_ADDRESS env var once 00_DeployHook.s.sol has run and mined/deployed
     // the hook's address - it can't be a compile-time constant since CREATE2 mining decides
@@ -45,7 +57,7 @@ contract BaseScript is Script, Deployers {
 
         deployerAddress = getDeployer();
 
-        if (block.chainid != 31337) {
+        if (!_usesFreshTestTokens()) {
             require(address(token0) != address(token1));
             (currency0, currency1) = token0 < token1
                 ? (Currency.wrap(address(token0)), Currency.wrap(address(token1)))
@@ -137,7 +149,7 @@ contract BaseScript is Script, Deployers {
     /// state, so without this a later script (e.g. 03_Swap.s.sol) would otherwise deploy a
     /// fresh pair and end up pointing at a pool that was never created.
     function ensureCurrencies() internal {
-        if (block.chainid != 31337 || Currency.unwrap(currency0) != address(0)) return;
+        if (!_usesFreshTestTokens() || Currency.unwrap(currency0) != address(0)) return;
 
         address envCurrency0 = vm.envOr("CURRENCY0", address(0));
         address envCurrency1 = vm.envOr("CURRENCY1", address(0));
