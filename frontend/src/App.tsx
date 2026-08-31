@@ -6,19 +6,22 @@ import { Proof } from './components/Proof'
 import { LiveQueue } from './components/LiveQueue'
 import { Faq } from './components/Faq'
 import { Footer } from './components/Footer'
+import { WalletProvider } from './context/WalletContext'
 import './App.css'
 
 export default function App() {
   return (
-    <div className="page">
-      <Nav />
-      <Hero />
-      <Problem />
-      <HowItWorks />
-      <Proof />
-      <LiveQueue />
-      <Faq />
-      <Footer />
-    </div>
+    <WalletProvider>
+      <div className="page">
+        <Nav />
+        <Hero />
+        <Problem />
+        <HowItWorks />
+        <Proof />
+        <LiveQueue />
+        <Faq />
+        <Footer />
+      </div>
+    </WalletProvider>
   )
 }

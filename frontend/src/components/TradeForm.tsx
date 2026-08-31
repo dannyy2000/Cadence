@@ -3,7 +3,7 @@ import { encodeAbiParameters, formatUnits, parseUnits, maxUint256 } from 'viem'
 import { publicClient } from '../viemClient'
 import { cadenceHookAbi, erc20Abi, permit2Abi, swapRouterAbi } from '../abi'
 import { config } from '../config'
-import { useWallet } from '../hooks/useWallet'
+import { useWallet } from '../context/WalletContext'
 import { useTokenInfo } from '../hooks/usePoolState'
 
 const poolKey = {

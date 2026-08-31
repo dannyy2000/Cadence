@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
 import { createWalletClient, custom, type WalletClient } from 'viem'
 import { config } from '../config'
 
@@ -27,7 +27,26 @@ export type WalletState = {
   error: string | null
 }
 
-export function useWallet() {
+type WalletContextValue = WalletState & {
+  hasInjectedWallet: boolean
+  isCorrectChain: boolean
+  targetChainId: number
+  targetChainName: string
+  walletClient: WalletClient | null
+  connect: () => Promise<void>
+  disconnect: () => void
+  switchToUnichainSepolia: () => Promise<void>
+}
+
+const WalletContext = createContext<WalletContextValue | null>(null)
+
+/// Holds the one canonical wallet connection for the whole app. Every component that needs
+/// wallet state reads from this same instance via useWallet() below - each component calling
+/// a plain (non-context) hook independently would otherwise give every one of them its own
+/// isolated, never-synced copy of "connected or not", which is exactly the bug this fixes:
+/// the nav's connect button and the trade form disagreeing about whether a wallet was
+/// connected, because each held its own separate state.
+export function WalletProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<WalletState>({
     address: null,
     chainId: null,
@@ -98,6 +117,26 @@ export function useWallet() {
     await refreshChainId()
   }, [refreshChainId])
 
+  // Detects a wallet that's already connected from a previous visit (eth_accounts, unlike
+  // eth_requestAccounts, never pops a prompt - it just reports the existing permission state)
+  // so a returning visitor doesn't have to click Connect again every reload.
+  useEffect(() => {
+    if (!window.ethereum) return
+    window.ethereum
+      .request({ method: 'eth_accounts' })
+      .then((accounts) => {
+        const list = accounts as string[]
+        if (list.length > 0) {
+          const client = createWalletClient({ transport: custom(window.ethereum!) })
+          setWalletClient(client)
+          setState((s) => ({ ...s, address: list[0] as `0x${string}` }))
+          refreshChainId()
+        }
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   useEffect(() => {
     if (!window.ethereum) return
 
@@ -119,7 +158,7 @@ export function useWallet() {
 
   const isCorrectChain = state.chainId === UNICHAIN_SEPOLIA.id
 
-  return {
+  const value: WalletContextValue = {
     ...state,
     hasInjectedWallet,
     isCorrectChain,
@@ -130,4 +169,14 @@ export function useWallet() {
     disconnect,
     switchToUnichainSepolia,
   }
+
+  return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
+}
+
+export function useWallet(): WalletContextValue {
+  const ctx = useContext(WalletContext)
+  if (!ctx) {
+    throw new Error('useWallet must be used inside <WalletProvider>')
+  }
+  return ctx
 }

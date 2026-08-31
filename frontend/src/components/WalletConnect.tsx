@@ -1,9 +1,20 @@
-import { useWallet } from '../hooks/useWallet'
+import { useWallet } from '../context/WalletContext'
 import { truncateAddress } from '../hooks/usePoolState'
 
 export function WalletConnect() {
-  const { address, connecting, error, hasInjectedWallet, isCorrectChain, targetChainName, connect, disconnect, switchToUnichainSepolia } =
-    useWallet()
+  const {
+    address,
+    chainId,
+    connecting,
+    error,
+    hasInjectedWallet,
+    isCorrectChain,
+    targetChainId,
+    targetChainName,
+    connect,
+    disconnect,
+    switchToUnichainSepolia,
+  } = useWallet()
 
   if (!hasInjectedWallet) {
     return (
@@ -32,9 +43,18 @@ export function WalletConnect() {
 
   if (!isCorrectChain) {
     return (
-      <button className="btn wallet-pill wallet-pill-warn" onClick={switchToUnichainSepolia}>
-        Switch to {targetChainName}
-      </button>
+      <div className="wallet-connect">
+        <button
+          className="btn wallet-pill wallet-pill-warn"
+          onClick={switchToUnichainSepolia}
+          title={`Wallet reports chain ${chainId ?? 'unknown'}, need ${targetChainId}`}
+        >
+          Switch to {targetChainName}
+        </button>
+        <span className="wallet-error mono">
+          detected: {chainId ?? '…'} (need {targetChainId})
+        </span>
+      </div>
     )
   }
 
