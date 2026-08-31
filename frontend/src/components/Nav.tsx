@@ -1,3 +1,5 @@
+import { WalletConnect } from './WalletConnect'
+
 export function Nav() {
   return (
     <nav className="nav">
@@ -23,14 +25,17 @@ export function Nav() {
             <a href="#faq">FAQ</a>
           </li>
         </ul>
-        <a
-          className="btn btn-secondary"
-          href="https://github.com/dannyy2000/Cadence"
-          target="_blank"
-          rel="noreferrer"
-        >
-          GitHub
-        </a>
+        <div className="nav-actions">
+          <a
+            className="btn btn-secondary"
+            href="https://github.com/dannyy2000/Cadence"
+            target="_blank"
+            rel="noreferrer"
+          >
+            GitHub
+          </a>
+          <WalletConnect />
+        </div>
       </div>
     </nav>
   )

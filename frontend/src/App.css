@@ -251,6 +251,17 @@ section {
   }
 }
 
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.nav-actions .btn {
+  padding: 0.55rem 1.1rem;
+  font-size: 0.85rem;
+}
+
 /* ---------- Buttons ---------- */
 
 .btn {
@@ -289,6 +300,42 @@ section {
 .btn-secondary:hover {
   border-color: var(--color-text-faint);
   background: var(--color-surface);
+}
+
+.wallet-connect {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.wallet-error {
+  font-size: 0.78rem;
+  color: var(--color-danger);
+  max-width: 220px;
+}
+
+.wallet-pill {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border-color: var(--color-border-strong);
+}
+
+.wallet-pill:hover {
+  border-color: var(--color-text-faint);
+}
+
+.wallet-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px var(--color-success-soft);
+}
+
+.wallet-pill-warn {
+  background: var(--color-warn-soft);
+  color: var(--color-warn);
+  border-color: var(--color-warn);
 }
 
 /* ---------- Hero ---------- */
@@ -677,6 +724,135 @@ section {
 .panel-error strong {
   display: block;
   margin-bottom: 0.4rem;
+}
+
+/* ---------- Trade form ---------- */
+
+.trade-form-locked {
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+}
+
+.trade-form-direction {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+.trade-direction-btn {
+  flex: 1;
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border-strong);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.trade-direction-btn.active {
+  border-color: var(--color-accent-border);
+  background: var(--color-accent-soft);
+  color: var(--color-text);
+}
+
+.trade-direction-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.trade-direction-arrow {
+  color: var(--color-text-faint);
+}
+
+.trade-form-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+
+.trade-amount-input {
+  flex: 1;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 0.65rem 0.8rem;
+  color: var(--color-text);
+  font-size: 1rem;
+  font-family: var(--font-mono);
+}
+
+.trade-amount-input:focus {
+  outline: none;
+  border-color: var(--color-accent-border);
+}
+
+.trade-amount-symbol {
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+  min-width: 3ch;
+}
+
+.trade-form-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  margin-bottom: 0.9rem;
+}
+
+.trade-mint-link {
+  background: none;
+  border: none;
+  color: var(--color-accent);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+}
+
+.trade-mint-link:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.trade-preview {
+  font-size: 0.8rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: var(--radius-sm);
+  margin-bottom: 0.9rem;
+}
+
+.trade-preview-instant {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.trade-preview-queue {
+  background: var(--color-warn-soft);
+  color: var(--color-warn);
+}
+
+.trade-submit {
+  width: 100%;
+}
+
+.trade-status {
+  margin-top: 0.75rem;
+  font-size: 0.82rem;
+}
+
+.trade-status-ok {
+  color: var(--color-text-muted);
+}
+
+.trade-status-error {
+  color: var(--color-danger);
 }
 
 .hint {

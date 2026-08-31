@@ -1,5 +1,6 @@
 import { config } from '../config'
 import { usePoolState, useTokenInfo, formatAmount, truncateAddress, type PoolState } from '../hooks/usePoolState'
+import { TradeForm } from './TradeForm'
 
 function BatchStatus({ state }: { state: PoolState }) {
   if (state.queueLength === 0n) {
@@ -88,6 +89,11 @@ export function LiveQueue() {
                         <dd>{state.batchDeadline === 0n ? '—' : `block ${state.batchDeadline.toString()}`}</dd>
                       </div>
                     </dl>
+                  </div>
+
+                  <div className="panel">
+                    <h3>Try a real trade</h3>
+                    <TradeForm />
                   </div>
                 </div>
 

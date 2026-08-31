@@ -18,9 +18,13 @@ export const config = {
   hookAddress: requireEnv('VITE_HOOK_ADDRESS') as Address,
   currency0: requireEnv('VITE_CURRENCY0') as Address,
   currency1: requireEnv('VITE_CURRENCY1') as Address,
+  routerAddress: requireEnv('VITE_ROUTER_ADDRESS') as Address,
   fee: Number(env.VITE_POOL_FEE ?? '3000'),
   tickSpacing: Number(env.VITE_POOL_TICK_SPACING ?? '60'),
   pollIntervalMs: Number(env.VITE_POLL_INTERVAL_MS ?? '3000'),
+  // Canonical across essentially every EVM chain (deployed via a deterministic factory) -
+  // not chain-specific like the addresses above, so not read from env.
+  permit2Address: '0x000000000022D473030F116dDEE9F6B43aC78BA3' as Address,
 }
 
 /// Mirrors PoolIdLibrary.toId: keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks)).
