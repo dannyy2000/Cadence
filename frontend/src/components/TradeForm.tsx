@@ -3,7 +3,7 @@ import { encodeAbiParameters, formatUnits, parseUnits, maxUint256 } from 'viem'
 import { publicClient } from '../viemClient'
 import { cadenceHookAbi, erc20Abi, permit2Abi, swapRouterAbi } from '../abi'
 import { config } from '../config'
-import { useWallet } from '../context/WalletContext'
+import { useWallet, unichainSepolia } from '../context/WalletContext'
 import { useTokenInfo } from '../hooks/usePoolState'
 
 const poolKey = {
@@ -74,7 +74,7 @@ export function TradeForm() {
     try {
       const hash = await walletClient.writeContract({
         account: address,
-        chain: undefined,
+        chain: unichainSepolia,
         address: sellCurrency,
         abi: erc20Abi,
         functionName: 'mint',
@@ -106,7 +106,7 @@ export function TradeForm() {
         setMessage(`Approving ${sellToken.symbol} for Permit2…`)
         const hash = await walletClient.writeContract({
           account: address,
-          chain: undefined,
+          chain: unichainSepolia,
           address: sellCurrency,
           abi: erc20Abi,
           functionName: 'approve',
@@ -130,7 +130,7 @@ export function TradeForm() {
         const oneDay = 24 * 60 * 60
         const hash = await walletClient.writeContract({
           account: address,
-          chain: undefined,
+          chain: unichainSepolia,
           address: config.permit2Address,
           abi: permit2Abi,
           functionName: 'approve',
@@ -150,7 +150,7 @@ export function TradeForm() {
       const deadline = BigInt(Math.floor(Date.now() / 1000) + 600)
       const hash = await walletClient.writeContract({
         account: address,
-        chain: undefined,
+        chain: unichainSepolia,
         address: config.routerAddress,
         abi: swapRouterAbi,
         functionName: 'swapExactTokensForTokens',

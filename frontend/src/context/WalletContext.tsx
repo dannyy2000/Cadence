@@ -1,14 +1,20 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
-import { createWalletClient, custom, type WalletClient } from 'viem'
+import { createWalletClient, custom, defineChain, type WalletClient } from 'viem'
 import { config } from '../config'
 
-const UNICHAIN_SEPOLIA = {
+// A properly-typed viem Chain, not just an object that happens to look like one - passed to
+// createWalletClient below so every write knows which network it's actually submitting to.
+// Without this, viem has no chain info anywhere and refuses to send anything, with an error
+// that (unhelpfully) looks unrelated to "which network."
+export const unichainSepolia = defineChain({
   id: 1301,
   name: 'Unichain Sepolia',
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
   rpcUrls: { default: { http: [config.rpcUrl] } },
   blockExplorers: { default: { name: 'Uniscan', url: 'https://sepolia.uniscan.xyz' } },
-} as const
+})
+
+const UNICHAIN_SEPOLIA = unichainSepolia
 
 declare global {
   interface Window {
@@ -71,7 +77,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, connecting: true, error: null }))
     try {
       const accounts = (await window.ethereum.request({ method: 'eth_requestAccounts' })) as string[]
-      const client = createWalletClient({ transport: custom(window.ethereum) })
+      const client = createWalletClient({ chain: UNICHAIN_SEPOLIA, transport: custom(window.ethereum) })
       setWalletClient(client)
       setState((s) => ({ ...s, address: accounts[0] as `0x${string}`, connecting: false }))
       await refreshChainId()
@@ -127,7 +133,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       .then((accounts) => {
         const list = accounts as string[]
         if (list.length > 0) {
-          const client = createWalletClient({ transport: custom(window.ethereum!) })
+          const client = createWalletClient({ chain: UNICHAIN_SEPOLIA, transport: custom(window.ethereum!) })
           setWalletClient(client)
           setState((s) => ({ ...s, address: list[0] as `0x${string}` }))
           refreshChainId()
