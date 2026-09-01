@@ -777,6 +777,7 @@ section {
 
 .trade-amount-input {
   flex: 1;
+  min-width: 0;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
