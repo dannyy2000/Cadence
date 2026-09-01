@@ -7,6 +7,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {IUniswapV4Router04} from "hookmate/interfaces/router/IUniswapV4Router04.sol";
 
 import {CadenceHook} from "../../src/CadenceHook.sol";
@@ -17,6 +18,7 @@ import {CadenceHook} from "../../src/CadenceHook.sol";
 contract CadenceHookHandler is Test {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
+    using StateLibrary for IPoolManager;
 
     // Must match the deployed hook's real threshold (set by the invariant test's setUp) -
     // arbitrary for testing purposes, not a production value. See
@@ -37,6 +39,18 @@ contract CadenceHookHandler is Test {
     uint256 public ghost_queued0In;
     /// @dev Sum of amountIn for currently-queued oneForZero (currency1-in) orders.
     uint256 public ghost_queued1In;
+
+    /// @dev The pool's sqrtPriceX96 read immediately before the most recently observed
+    /// settlement began - the same read _settle's own SettlementContext would see, since
+    /// nothing else can move the pool's price between this read and _settle's internal one
+    /// within a single atomic transaction, regardless of which of the two settlement
+    /// triggers fired.
+    uint160 public ghost_lastReferenceSqrtPriceX96;
+    /// @dev The pool's sqrtPriceX96 immediately after that same settlement's swaps completed.
+    uint160 public ghost_lastSettledSqrtPriceX96;
+    /// @dev True once at least one settlement has been observed by the handler - guards the
+    /// invariant from checking the two ghost prices above before either has been set.
+    bool public ghost_settlementObserved;
 
     constructor(
         IPoolManager _poolManager,
@@ -75,6 +89,11 @@ contract CadenceHookHandler is Test {
         bool deadlineTriggered = deadlineBefore != 0 && block.number >= deadlineBefore;
 
         uint256 queueLengthBefore = hook.queueLength(poolId);
+        // The reference price CLVR will use if this call triggers a settlement (either
+        // trigger): nothing between this read and _settle's own internal getSlot0 read can
+        // move the pool's price, since it's all one atomic transaction and everything in
+        // between is bookkeeping (queue push, custody take), not a swap.
+        (uint160 priceBeforeCall,,,) = poolManager.getSlot0(poolId);
 
         swapRouter.swapExactTokensForTokens({
             amountIn: amountIn,
@@ -87,6 +106,16 @@ contract CadenceHookHandler is Test {
         });
 
         uint256 queueLengthAfter = hook.queueLength(poolId);
+
+        // A settlement happened in this call if the primary (deadline) trigger fired, or if
+        // a nonempty queue got wiped without it (which can only be the size-cap trigger).
+        bool settlementOccurred = deadlineTriggered || (queueLengthBefore > 0 && queueLengthAfter == 0);
+        if (settlementOccurred) {
+            (uint160 priceAfterCall,,,) = poolManager.getSlot0(poolId);
+            ghost_lastReferenceSqrtPriceX96 = priceBeforeCall;
+            ghost_lastSettledSqrtPriceX96 = priceAfterCall;
+            ghost_settlementObserved = true;
+        }
 
         if (queueLengthAfter == 0) {
             // Nothing queued afterward - either there was nothing to begin with and this
@@ -128,7 +157,13 @@ contract CadenceHookHandler is Test {
         uint256 deadline = hook.batchDeadline(poolId);
         if (deadline == 0 || block.number < deadline) return;
 
+        (uint160 priceBeforeCall,,,) = poolManager.getSlot0(poolId);
         hook.settle(poolKey);
+        (uint160 priceAfterCall,,,) = poolManager.getSlot0(poolId);
+        ghost_lastReferenceSqrtPriceX96 = priceBeforeCall;
+        ghost_lastSettledSqrtPriceX96 = priceAfterCall;
+        ghost_settlementObserved = true;
+
         ghost_queued0In = 0;
         ghost_queued1In = 0;
     }

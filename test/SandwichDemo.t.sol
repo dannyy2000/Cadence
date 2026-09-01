@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {Vm} from "forge-std/Vm.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -557,5 +558,108 @@ contract SandwichDemoTest is BaseTest {
         emit log_named_int("attacker token profit (wei of token1)", tokenProfit);
         emit log_named_uint("gas used (both attacker txns)", totalGas);
         emit log_named_uint("real gas cost (wei of ETH, at Unichain Sepolia's observed price)", gasCostWei);
+    }
+
+    /// @notice Stronger than testSandwich_CadencePool_OutcomeVariesAcrossSettlementBlocks,
+    /// which only proves the merged outcome is sometimes LOWER than the plain pool's
+    /// guaranteed profit. This proves the merged tie's profit is EXACTLY identical across
+    /// several different settlement blocks, not merely "both below the plain-pool figure" -
+    /// directly backing the README/frontend's "12/12 identical" claim with a regression
+    /// check that would catch a future change accidentally reintroducing block-dependent
+    /// variance.
+    function testSandwich_CadencePool_MergedProfitIsIdenticalNotJustLower() public {
+        int256 firstTrialProfit = _runCadenceSandwichTrial(0);
+        for (uint256 trial = 1; trial < 5; trial++) {
+            int256 profit = _runCadenceSandwichTrial(trial);
+            assertEq(
+                profit,
+                firstTrialProfit,
+                "the merged tie's profit must be EXACTLY identical across settlement blocks, not merely both below the plain pool's guaranteed profit"
+            );
+        }
+    }
+
+    /// @notice Proves two unrelated exact ties in the same batch merge independently of each
+    /// other - different size, different direction - rather than all four orders somehow
+    /// being lumped into one group, or one pair's tie leaking into the other's.
+    function testSandwich_TwoIndependentTiePairsInSameBatch_BothMergeIndependently() public {
+        address flags =
+            address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG) ^ (0x9012 << 144));
+        bytes memory constructorArgs = abi.encode(poolManager, BATCH_THRESHOLD, BATCH_WINDOW_BLOCKS, MAX_BATCH_SIZE);
+        deployCodeTo("CadenceHook.sol:CadenceHook", constructorArgs, flags);
+        CadenceHook hook = CadenceHook(flags);
+
+        PoolKey memory cadenceKey = PoolKey(currency0, currency1, 3000, 60, IHooks(hook));
+        PoolId cadencePoolId = cadenceKey.toId();
+        _seedLiquidity(cadenceKey);
+
+        address pair1A = makeAddr("twoTiesP1A");
+        address pair1B = makeAddr("twoTiesP1B");
+        address pair2A = makeAddr("twoTiesP2A");
+        address pair2B = makeAddr("twoTiesP2B");
+        _fundAndApprove(pair1A, true);
+        _fundAndApprove(pair1B, true);
+        _fundAndApprove(pair2A, true);
+        _fundAndApprove(pair2B, true);
+
+        uint256 pair1Size = 20_000e18;
+        uint256 pair2Size = 12_000e18;
+
+        for (uint256 i = 0; i < 2; i++) {
+            address trader = i == 0 ? pair1A : pair1B;
+            vm.prank(trader);
+            swapRouter.swapExactTokensForTokens({
+                amountIn: pair1Size,
+                amountOutMin: 0,
+                zeroForOne: false,
+                poolKey: cadenceKey,
+                hookData: abi.encode(trader),
+                receiver: trader,
+                deadline: block.timestamp + 1
+            });
+        }
+        for (uint256 i = 0; i < 2; i++) {
+            address trader = i == 0 ? pair2A : pair2B;
+            vm.prank(trader);
+            swapRouter.swapExactTokensForTokens({
+                amountIn: pair2Size,
+                amountOutMin: 0,
+                zeroForOne: true,
+                poolKey: cadenceKey,
+                hookData: abi.encode(trader),
+                receiver: trader,
+                deadline: block.timestamp + 1
+            });
+        }
+
+        vm.roll(hook.batchDeadline(cadencePoolId));
+
+        vm.recordLogs();
+        hook.settle(cadenceKey);
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+
+        bytes32 orderSettledTopic0 = keccak256("OrderSettled(bytes32,address,bool,uint256,uint256)");
+        uint256 step1A = type(uint256).max;
+        uint256 step1B = type(uint256).max;
+        uint256 step2A = type(uint256).max;
+        uint256 step2B = type(uint256).max;
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].topics.length == 0 || entries[i].topics[0] != orderSettledTopic0) continue;
+            (,, uint256 step) = abi.decode(entries[i].data, (bool, uint256, uint256));
+            address trader = address(uint160(uint256(entries[i].topics[2])));
+            if (trader == pair1A) step1A = step;
+            if (trader == pair1B) step1B = step;
+            if (trader == pair2A) step2A = step;
+            if (trader == pair2B) step2B = step;
+        }
+
+        assertTrue(
+            step1A != type(uint256).max && step1B != type(uint256).max && step2A != type(uint256).max
+                && step2B != type(uint256).max,
+            "all four traders across both independent tie pairs must settle"
+        );
+        assertEq(step1A, step1B, "pair 1's exact tie must merge together");
+        assertEq(step2A, step2B, "pair 2's exact tie must merge together, independently of pair 1");
+        assertTrue(step1A != step2A, "the two unrelated pairs must not be merged with each other - different size, different direction");
     }
 }

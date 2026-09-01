@@ -114,4 +114,31 @@ contract CadenceHookInvariantTest is BaseTest {
     function invariant_QueueNeverExceedsMaxBatchSize() public view {
         assertLe(hook.queueLength(poolId), hook.maxBatchSize(), "queue must never exceed the configured cap");
     }
+
+    /// @dev A property of settlement *pricing* specifically, not just queue/settlement
+    /// mechanics - the item MILESTONES.md had flagged as still open. Checks that the pool's
+    /// price immediately after any settlement observed during this randomized run stays
+    /// within a generous sanity band of the reference price CLVR captured for that same
+    /// settlement (see the handler's ghost_lastReferenceSqrtPriceX96/
+    /// ghost_lastSettledSqrtPriceX96 for exactly what's captured and why it's provably the
+    /// same reference _settle itself uses).
+    ///
+    /// This is deliberately NOT a tight bound on CLVR's formal deviation-minimization
+    /// guarantee - proving that precisely would mean replicating the paper's own optimality
+    /// proof in Solidity. It's a coarse correctness check sized to the realistic swap
+    /// amounts this handler can generate (up to 50e18 per order, up to 20 orders per batch,
+    /// against 1,000,000e18 of full-range liquidity - a worst-case single-direction batch is
+    /// ~0.1% of pool depth, whose real price impact is a small fraction of a percent). A 4x
+    /// sqrtPrice band (16x in actual price terms) leaves enormous headroom above that
+    /// realistic worst case, so it would only ever fail on a genuine bug - wrong swap
+    /// direction, a sign error, or a corrupted price read - not on legitimate variance.
+    function invariant_SettlementPriceStaysWithinSanityBandOfReference() public view {
+        if (!handler.ghost_settlementObserved()) return;
+
+        uint256 referencePrice = uint256(handler.ghost_lastReferenceSqrtPriceX96());
+        uint256 settled = uint256(handler.ghost_lastSettledSqrtPriceX96());
+
+        assertLe(settled, referencePrice * 4, "post-settlement price moved implausibly far above the settlement's own reference price");
+        assertGe(settled * 4, referencePrice, "post-settlement price moved implausibly far below the settlement's own reference price");
+    }
 }
