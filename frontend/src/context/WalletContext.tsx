@@ -50,6 +50,9 @@ declare global {
 }
 
 const LAST_WALLET_KEY = 'cadence.lastWalletRdns'
+// Sentinel for "connected via the legacy window.ethereum slot, no EIP-6963 rdns available" -
+// distinct from any real rdns string, so it round-trips through localStorage unambiguously.
+const LEGACY_KEY = '__legacy_window_ethereum__'
 
 export type WalletState = {
   address: `0x${string}` | null
@@ -103,16 +106,33 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const availableWallets = Array.from(wallets.values()).map((w) => w.info)
   const hasInjectedWallet = wallets.size > 0 || (typeof window !== 'undefined' && !!window.ethereum)
 
-  // Resolves which provider a connect() call should use: an explicit choice, else the wallet
-  // used last time (if it's still installed), else the only one if there's just one, else the
-  // legacy single-slot as a last resort for a wallet that doesn't support EIP-6963 yet.
+  // Resolves which provider a connect() call should use, paired with an unambiguous key
+  // identifying it - an explicit choice, else the wallet used last time (if it's still
+  // installed), else the only one if there's just one, else the legacy single-slot as a last
+  // resort for a wallet that doesn't support EIP-6963 yet. Returning the key alongside the
+  // provider (rather than trying to reverse-engineer it later by comparing object references)
+  // is deliberate: the legacy window.ethereum fallback would never match any entry in the
+  // `wallets` map by reference, so a lookup-after-the-fact would silently and permanently fail
+  // to record it - which is exactly the bug that made every single page reload never
+  // reconnect, not just an occasional one.
   const resolveProvider = useCallback(
-    (rdns?: string): InjectedProvider | null => {
-      if (rdns) return wallets.get(rdns)?.provider ?? null
+    (rdns?: string): { provider: InjectedProvider; key: string } | null => {
+      if (rdns) {
+        const provider = wallets.get(rdns)?.provider
+        return provider ? { provider, key: rdns } : null
+      }
       const lastUsed = typeof window !== 'undefined' ? localStorage.getItem(LAST_WALLET_KEY) : null
-      if (lastUsed && wallets.has(lastUsed)) return wallets.get(lastUsed)!.provider
-      if (wallets.size === 1) return Array.from(wallets.values())[0].provider
-      if (wallets.size === 0 && typeof window !== 'undefined' && window.ethereum) return window.ethereum
+      if (lastUsed === LEGACY_KEY && typeof window !== 'undefined' && window.ethereum) {
+        return { provider: window.ethereum, key: LEGACY_KEY }
+      }
+      if (lastUsed && wallets.has(lastUsed)) return { provider: wallets.get(lastUsed)!.provider, key: lastUsed }
+      if (wallets.size === 1) {
+        const [key, detail] = Array.from(wallets.entries())[0]
+        return { provider: detail.provider, key }
+      }
+      if (wallets.size === 0 && typeof window !== 'undefined' && window.ethereum) {
+        return { provider: window.ethereum, key: LEGACY_KEY }
+      }
       return null
     },
     [wallets],
@@ -125,8 +145,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   const connect = useCallback(
     async (rdns?: string) => {
-      const provider = resolveProvider(rdns)
-      if (!provider) {
+      const resolved = resolveProvider(rdns)
+      if (!resolved) {
         setState((s) => ({
           ...s,
           error:
@@ -136,6 +156,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         }))
         return
       }
+      const { provider, key } = resolved
       setState((s) => ({ ...s, connecting: true, error: null }))
       try {
         const accounts = (await provider.request({ method: 'eth_requestAccounts' })) as string[]
@@ -143,8 +164,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         const client = createWalletClient({ chain: UNICHAIN_SEPOLIA, transport: custom(provider) })
         setWalletClient(client)
         setState((s) => ({ ...s, address: accounts[0] as `0x${string}`, connecting: false }))
-        const chosenRdns = rdns ?? Array.from(wallets.entries()).find(([, w]) => w.provider === provider)?.[0]
-        if (chosenRdns && typeof window !== 'undefined') localStorage.setItem(LAST_WALLET_KEY, chosenRdns)
+        if (typeof window !== 'undefined') localStorage.setItem(LAST_WALLET_KEY, key)
         await refreshChainId(provider)
       } catch (err) {
         setState((s) => ({
@@ -195,7 +215,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   // eth_requestAccounts, never pops a prompt - it just reports the existing permission state)
   // so a returning visitor doesn't have to click Connect again every reload. Specifically
   // prefers whichever wallet was used last time, so a multi-wallet visitor doesn't get
-  // silently reconnected to the wrong one.
+  // silently reconnected to the wrong one. This depends on connect() having actually recorded
+  // an unambiguous key for whichever provider it used (see resolveProvider's LEGACY_KEY
+  // handling) - the previous version tried to reverse-engineer that key afterward by matching
+  // object references, which silently failed forever whenever the legacy window.ethereum
+  // fallback was used, since it can never match anything in the `wallets` map by reference.
+  // That was the actual bug behind every single reload asking to reconnect, not just some.
   //
   // The short delay here is deliberate, not arbitrary: EIP-6963 discovery is asynchronous and
   // has no "every wallet has finished announcing itself" signal, so on the very first render
@@ -210,8 +235,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const timer = setTimeout(() => {
       if (wallets.size === 0 && !(typeof window !== 'undefined' && window.ethereum)) return
-      const provider = resolveProvider()
-      if (!provider) return
+      const resolved = resolveProvider()
+      if (!resolved) return
+      const { provider } = resolved
       provider
         .request({ method: 'eth_accounts' })
         .then((accounts) => {
