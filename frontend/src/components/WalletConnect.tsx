@@ -1,9 +1,11 @@
+import { useState } from 'react'
 import { useWallet } from '../context/WalletContext'
 import { truncateAddress } from '../hooks/usePoolState'
 
 export function WalletConnect() {
   const {
     address,
+    availableWallets,
     chainId,
     connecting,
     error,
@@ -15,6 +17,7 @@ export function WalletConnect() {
     disconnect,
     switchToUnichainSepolia,
   } = useWallet()
+  const [pickerOpen, setPickerOpen] = useState(false)
 
   if (!hasInjectedWallet) {
     return (
@@ -31,9 +34,39 @@ export function WalletConnect() {
   }
 
   if (!address) {
+    // More than one wallet extension installed - let the user pick which one, instead of
+    // silently grabbing whichever one happened to win the legacy window.ethereum slot.
+    if (availableWallets.length > 1) {
+      return (
+        <div className="wallet-connect wallet-picker-wrap">
+          <button className="btn btn-primary" onClick={() => setPickerOpen((v) => !v)} disabled={connecting}>
+            {connecting ? 'Connecting…' : 'Connect Wallet'}
+          </button>
+          {pickerOpen && (
+            <div className="wallet-picker">
+              {availableWallets.map((wallet) => (
+                <button
+                  key={wallet.rdns}
+                  className="wallet-picker-option"
+                  onClick={() => {
+                    setPickerOpen(false)
+                    connect(wallet.rdns)
+                  }}
+                >
+                  <img src={wallet.icon} alt="" className="wallet-picker-icon" />
+                  {wallet.name}
+                </button>
+              ))}
+            </div>
+          )}
+          {error && <span className="wallet-error">{error}</span>}
+        </div>
+      )
+    }
+
     return (
       <div className="wallet-connect">
-        <button className="btn btn-primary" onClick={connect} disabled={connecting}>
+        <button className="btn btn-primary" onClick={() => connect()} disabled={connecting}>
           {connecting ? 'Connecting…' : 'Connect Wallet'}
         </button>
         {error && <span className="wallet-error">{error}</span>}

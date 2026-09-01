@@ -338,6 +338,51 @@ section {
   border-color: var(--color-warn);
 }
 
+.wallet-picker-wrap {
+  position: relative;
+}
+
+.wallet-picker {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  z-index: 30;
+  min-width: 180px;
+  background: var(--color-bg-raised);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  padding: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.wallet-picker-option {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.6rem;
+  color: var(--color-text);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+
+.wallet-picker-option:hover {
+  background: var(--color-surface);
+}
+
+.wallet-picker-icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+}
+
 /* ---------- Hero ---------- */
 
 .hero {
