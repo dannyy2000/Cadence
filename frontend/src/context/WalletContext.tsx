@@ -193,26 +193,40 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   // Detects a wallet that's already connected from a previous visit (eth_accounts, unlike
   // eth_requestAccounts, never pops a prompt - it just reports the existing permission state)
-  // so a returning visitor doesn't have to click Connect again every reload. Waits for wallet
-  // discovery to have had a chance to run first, and specifically prefers whichever wallet was
-  // used last time, so a multi-wallet visitor doesn't get silently reconnected to the wrong one.
+  // so a returning visitor doesn't have to click Connect again every reload. Specifically
+  // prefers whichever wallet was used last time, so a multi-wallet visitor doesn't get
+  // silently reconnected to the wrong one.
+  //
+  // The short delay here is deliberate, not arbitrary: EIP-6963 discovery is asynchronous and
+  // has no "every wallet has finished announcing itself" signal, so on the very first render
+  // `wallets` is still empty even though window.ethereum may already be populated by whichever
+  // extension happened to load first - resolveProvider() would then fall back to that one
+  // specifically, which may not be the wallet actually used last time, and silently find no
+  // accounts on it while the real one hadn't announced itself yet. Waiting briefly lets
+  // discovery actually populate `wallets` first, so the lastUsed match in resolveProvider()
+  // has something real to match against. The effect still re-runs and re-debounces every time
+  // `wallets` changes (each new wallet announcing itself), via the cleanup below cancelling
+  // any pending, now-stale attempt.
   useEffect(() => {
-    if (wallets.size === 0 && !(typeof window !== 'undefined' && window.ethereum)) return
-    const provider = resolveProvider()
-    if (!provider) return
-    provider
-      .request({ method: 'eth_accounts' })
-      .then((accounts) => {
-        const list = accounts as string[]
-        if (list.length > 0) {
-          setActiveProvider(provider)
-          const client = createWalletClient({ chain: UNICHAIN_SEPOLIA, transport: custom(provider) })
-          setWalletClient(client)
-          setState((s) => ({ ...s, address: list[0] as `0x${string}` }))
-          refreshChainId(provider)
-        }
-      })
-      .catch(() => {})
+    const timer = setTimeout(() => {
+      if (wallets.size === 0 && !(typeof window !== 'undefined' && window.ethereum)) return
+      const provider = resolveProvider()
+      if (!provider) return
+      provider
+        .request({ method: 'eth_accounts' })
+        .then((accounts) => {
+          const list = accounts as string[]
+          if (list.length > 0) {
+            setActiveProvider(provider)
+            const client = createWalletClient({ chain: UNICHAIN_SEPOLIA, transport: custom(provider) })
+            setWalletClient(client)
+            setState((s) => ({ ...s, address: list[0] as `0x${string}` }))
+            refreshChainId(provider)
+          }
+        })
+        .catch(() => {})
+    }, 250)
+    return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wallets])
 
