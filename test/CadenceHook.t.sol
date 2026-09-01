@@ -807,6 +807,71 @@ contract CadenceHookTest is BaseTest {
         assertGt(goodToken.balanceOf(otherTrader), 0, "the other queued order should settle normally too");
     }
 
+    /// @dev Prompted by an external report (github.com/dannyy2000/Cadence/issues/1): _settling
+    /// is a single flag, not namespaced per pool, so this checks the case that test doesn't -
+    /// not "can a payout reenter the pool currently settling" (already covered above) but "can
+    /// a payout during pool A's settlement reach a *different* pool B sharing the same hook,
+    /// while _settling is (wrongly, from B's perspective) still true from A's in-progress
+    /// settlement." If the existing `sender != address(this)` guard only meant to protect the
+    /// pool actually being settled, this is exactly the gap that could slip through - and
+    /// nothing this file already runs actually exercises a second, independent pool during an
+    /// active reentrancy attempt.
+    function _initSecondPoolOnHook(CadenceHook targetHook) private returns (PoolKey memory poolKeyB, PoolId poolIdB) {
+        (Currency c2, Currency c3) = deployCurrencyPair();
+        poolKeyB = PoolKey(c2, c3, 3000, 60, IHooks(targetHook));
+        poolIdB = poolKeyB.toId();
+        poolManager.initialize(poolKeyB, Constants.SQRT_PRICE_1_1);
+        int24 tickLowerB = TickMath.minUsableTick(poolKeyB.tickSpacing);
+        int24 tickUpperB = TickMath.maxUsableTick(poolKeyB.tickSpacing);
+        (uint256 amt0B, uint256 amt1B) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLowerB),
+            TickMath.getSqrtPriceAtTick(tickUpperB),
+            1000e18
+        );
+        positionManager.mint(
+            poolKeyB, tickLowerB, tickUpperB, 1000e18, amt0B + 1, amt1B + 1, address(this), block.timestamp, Constants.ZERO_BYTES
+        );
+    }
+
+    function testReentrancy_CrossPoolSwapAttemptedDuringSettlementIsRejected() public {
+        (CadenceHook reHook, PoolKey memory rePoolKeyA, , MaliciousReentrantToken badToken, bool badIsCurrency1) =
+            _deployReentrancyTestPool();
+        PoolId rePoolIdA = rePoolKeyA.toId();
+
+        // A second, independent pool on the *same* hook instance - distinct tokens, its own
+        // queue, nothing to do with pool A other than sharing reHook.
+        (PoolKey memory rePoolKeyB, PoolId rePoolIdB) = _initSecondPoolOnHook(reHook);
+
+        // Re-arm the malicious token to target pool B specifically, not the pool actually
+        // being settled (pool A) - this is the cross-pool case, not a repeat of the same-pool one.
+        badToken.arm(poolManager, rePoolKeyB);
+
+        address victim = makeAddr("crossPoolReentrancyVictim");
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 10e18,
+            amountOutMin: 0,
+            zeroForOne: badIsCurrency1,
+            poolKey: rePoolKeyA,
+            hookData: abi.encode(victim),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        vm.roll(reHook.batchDeadline(rePoolIdA));
+        reHook.settle(rePoolKeyA);
+
+        assertTrue(badToken.reentryAttempted(), "malicious token should have attempted to reach pool B");
+        assertTrue(badToken.reentryReverted(), "the cross-pool reentrant swap attempt must have been rejected too");
+
+        // Pool A settled fine despite the attempt, and pool B - the actual target of the
+        // attempted reentrancy - was never touched at all.
+        assertEq(reHook.queueLength(rePoolIdA), 0);
+        assertGt(badToken.balanceOf(victim), 0, "victim should still receive their real payout");
+        assertEq(reHook.queueLength(rePoolIdB), 0, "pool B must show zero effect from the attempted reentrancy");
+        assertEq(reHook.batchDeadline(rePoolIdB), 0, "pool B must never have had a batch opened by the attack");
+    }
+
     function _deployGriefingTestPool()
         private
         returns (CadenceHook grHook, PoolKey memory grPoolKey, MockERC20 goodToken, BlacklistingToken badToken)
