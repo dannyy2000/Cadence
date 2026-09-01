@@ -280,7 +280,7 @@ Two on-chain transaction receipts, side by side, for both fix attempts. No slide
 
 ## 👥 Team
 
-*[Names / roles / contact — to be completed before submission]*
+**Akinsanya Daniel** ([@dannyy2000](https://github.com/dannyy2000)) — sole builder: contracts, tests, frontend, and research.
 
 <div align="center">
 
