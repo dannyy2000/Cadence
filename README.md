@@ -123,6 +123,8 @@ Modeled directly on **CoW Protocol's** live, production fee mechanism [5]: a sma
 - Trades **below** the size threshold execute instantly, exactly like a normal Uniswap swap. No batching, no added latency, no added cost.
 - Only trades **above** the threshold join the batch queue — grounded directly in the economics of the attack itself: a sandwich attacker's profit scales with trade size, so small trades are rarely worth attacking. Protection is applied precisely where it's needed; latency is paid precisely where it's justified.
 
+**How the threshold value itself is set — calibrated, not guessed.** Zhou, Qin, Ferreira Torres, Le & Gervais [10] show that a sandwich attack has a genuine *minimum profitable victim input*: below it, the attack costs the attacker more (gas plus the swap fee on both legs) than it extracts, so it isn't attempted at all — and their own suggested mitigation is exactly a size-threshold defense in the smart contract, which is what `batchThreshold` already is. Their empirical number (~0.3–0.5% of pool depth) was measured against 2019 Ethereum mainnet gas prices, which don't transfer to a different chain's economics — cheaper gas makes smaller attacks worthwhile, so a number borrowed from a different gas environment isn't trustworthy. Rather than reuse their number, we replicated their *method*: `test/SandwichDemo.t.sol`'s `testSandwich_MinimumProfitableSizeSweep()` runs the real attack across a range of trade sizes against our own pool, at Unichain Sepolia's actual observed gas price, and finds exactly where profit crosses from negative to positive. Tested at two pool sizes 10,000× apart (100e18 and 1,000,000e18 in reserves), both independently landed on the same ~0.3–0.4% ratio — close to, but derived independently of, the paper's own figure. `script/00_DeployHook.s.sol`'s `BATCH_THRESHOLD` is set from that measured ratio applied to the actual deployed pool's reserves, not copied from a different chain's economy. If the deployed pool's size changes, that sweep should be re-run rather than assuming the ratio still holds.
+
 ### ⏳ Batch window mechanics
 
 - Tracked via `block.number`, **not** `block.timestamp` — `block.number` is protocol-guaranteed to increase by exactly one per block, while `block.timestamp` can be minutely influenced by whoever proposes a block.
@@ -171,7 +173,7 @@ Five concrete failure modes were identified and closed. Each has real precedent 
 
 **Order-splitting to evade the threshold**
 **Risk:** splitting a large trade into smaller ones is a documented real strategy, measurably reducing price impact by 60–82% vs. a single large trade — an attacker could chop a trade into threshold-dodging pieces.
-**Fix:** the threshold check is based on **cumulative price impact within the batch window**, not any single order's isolated size. A split trade still gets swept in once cumulative impact crosses the line.
+**Fix:** the threshold check is based on **cumulative price impact within the batch window**, not any single order's isolated size. A split trade still gets swept in once cumulative impact crosses the line. This matters more once the threshold itself is genuinely calibrated to the real minimum-profitable-attack size (see "How the threshold value itself is set" above) rather than a round guess — evading a real, tight number is worth more effort than evading an arbitrary one.
 
 </td></tr>
 <tr><td>2️⃣</td><td>
@@ -260,6 +262,8 @@ Two on-chain transaction receipts, side by side, for both fix attempts. No slide
 `[4]` Ramseyer, G., Goyal, M., Goel, A., & Mazières, D. (2024). *Augmenting Batch Exchanges with Constant Function Market Makers.* ACM Conference on Economics and Computation (EC '24). arXiv:2210.04929. [https://arxiv.org/abs/2210.04929](https://arxiv.org/abs/2210.04929)
 
 `[7]` McMenamin, C., & Daza, V. (2022). *FairTraDEX: A Decentralised Exchange Preventing Value Extraction.* arXiv:2202.06384. [https://arxiv.org/abs/2202.06384](https://arxiv.org/abs/2202.06384)
+
+`[10]` Zhou, L., Qin, K., Ferreira Torres, C., Le, D. V., & Gervais, A. (2020). *High-Frequency Trading on Decentralized On-Chain Exchanges.* arXiv:2009.14021. [https://arxiv.org/abs/2009.14021](https://arxiv.org/abs/2009.14021)
 
 **Production systems & technical documentation:**
 

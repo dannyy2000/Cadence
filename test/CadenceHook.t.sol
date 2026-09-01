@@ -33,6 +33,9 @@ contract CadenceHookTest is BaseTest {
     using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
 
+    // A fixed, arbitrary value for exercising the above/below-threshold code paths in
+    // isolation - not a production recommendation. See script/00_DeployHook.s.sol for the
+    // actual calibrated value, derived from testSandwich_MinimumProfitableSizeSweep().
     uint256 constant BATCH_THRESHOLD = 5e18;
     uint256 constant BATCH_WINDOW_BLOCKS = 10;
     uint256 constant MAX_BATCH_SIZE = 20;

@@ -38,6 +38,11 @@ contract SandwichDemoTest is BaseTest {
     uint256 constant VICTIM_AMOUNT_IN = 50_000e18; // token1 -> token0
     uint256 constant FRONT_RUN_AMOUNT_IN = 50_000e18; // token1 -> token0, identical to victim's
 
+    // Used only for the Cadence-pool tests below (batching mechanics, not attack economics) -
+    // arbitrary relative to POOL_LIQUIDITY, deliberately not the same calibrated ratio
+    // testSandwich_MinimumProfitableSizeSweep() derives further down in this file, since these
+    // tests care about exercising the queue/settlement path, not about whether this specific
+    // trade size would really be worth attacking.
     uint256 constant BATCH_THRESHOLD = 5e18;
     uint256 constant BATCH_WINDOW_BLOCKS = 10;
     uint256 constant MAX_BATCH_SIZE = 20;
@@ -396,5 +401,161 @@ contract SandwichDemoTest is BaseTest {
 
         emit log_named_int("[NOISY BATCH] attacker token1 profit", attackerProfit);
         emit log_named_int("[ISOLATED PAIR, for comparison] attacker token1 profit", 4417784300644256932920);
+    }
+
+    /// @notice Finds a real, derived batchThreshold instead of an assumed one: for a sweep of
+    /// trade sizes, run the actual classic sandwich against a plain pool and record (a) the
+    /// attacker's real token profit and (b) the real gas cost of the attacker's two
+    /// transactions, priced at Unichain Sepolia's real observed gas price (0.001000001 gwei,
+    /// from the actual deploy broadcast logs - see MILESTONES.md), not a mainnet-2019 number
+    /// borrowed from the paper's own study. This replicates the paper's *method* (empirically
+    /// find where profit crosses the cost of attacking) rather than transplanting its
+    /// *number*, which was calibrated for a completely different gas-price environment.
+    function testSandwich_MinimumProfitableSizeSweep() public {
+        uint256 realGasPriceWei = 1_000_001; // 0.001000001 gwei, observed on Unichain Sepolia
+
+        // Pool A: SandwichDemoTest's own scale (1,000,000e18) - crossover already narrowed to
+        // 3,000-4,000e18 (~0.3-0.4% of depth) in an earlier pass of this sweep.
+        uint256[3] memory sizesA = [uint256(3_000e18), 3_500e18, 4_000e18];
+        for (uint256 i = 0; i < sizesA.length; i++) {
+            emit log_string("=== Pool A: 1,000,000e18 liquidity (SandwichDemoTest scale) ===");
+            _runSweepTrial(sizesA[i], realGasPriceWei, i, POOL_LIQUIDITY);
+        }
+
+        // Pool B: the real deploy script's actual scale (script/01_CreatePoolAndAddLiquidity.s.sol
+        // seeds 100e18/100e18) - the pool size that actually matters for the live Unichain
+        // Sepolia deployment. Four orders of magnitude smaller than Pool A, so its crossover
+        // is not assumed to scale down by the same 0.3-0.4% ratio - it's measured separately.
+        uint256[7] memory sizesB = [
+            uint256(1e16), // 0.01
+            1e17, // 0.1
+            2e17, // 0.2
+            3e17, // 0.3
+            4e17, // 0.4
+            5e17, // 0.5
+            1e18 // 1
+        ];
+        for (uint256 i = 0; i < sizesB.length; i++) {
+            emit log_string("=== Pool B: 100e18 liquidity (real deploy script scale) ===");
+            _runSweepTrial(sizesB[i], realGasPriceWei, 100 + i, 100e18);
+        }
+    }
+
+    /// @dev Same approval set as _fundAndApprove (proven working in the tests above) - direct
+    /// router approval and Permit2->PoolManager approval both matter here, not just
+    /// Permit2->router, or settlement's direct transferFrom reverts on a missing allowance.
+    function _approveTrader(Currency c0, Currency c1, address who) internal {
+        vm.startPrank(who);
+        MockERC20(Currency.unwrap(c0)).approve(address(permit2), type(uint256).max);
+        MockERC20(Currency.unwrap(c1)).approve(address(permit2), type(uint256).max);
+        MockERC20(Currency.unwrap(c0)).approve(address(swapRouter), type(uint256).max);
+        MockERC20(Currency.unwrap(c1)).approve(address(swapRouter), type(uint256).max);
+        permit2.approve(Currency.unwrap(c0), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(Currency.unwrap(c1), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(Currency.unwrap(c0), address(poolManager), type(uint160).max, type(uint48).max);
+        permit2.approve(Currency.unwrap(c1), address(poolManager), type(uint160).max, type(uint48).max);
+        vm.stopPrank();
+    }
+
+    function _setUpSweepTrial(uint256 trial, uint256 poolLiquidity)
+        internal
+        returns (PoolKey memory plainKey, address trialAttacker, address trialVictim)
+    {
+        (Currency c0, Currency c1) = deployCurrencyPair();
+        trialAttacker = makeAddr(string.concat("sweepAttacker", vm.toString(trial)));
+        trialVictim = makeAddr(string.concat("sweepVictim", vm.toString(trial)));
+
+        MockERC20(Currency.unwrap(c0)).mint(address(this), 3_000_000_000e18);
+        MockERC20(Currency.unwrap(c1)).mint(address(this), 3_000_000_000e18);
+        MockERC20(Currency.unwrap(c0)).approve(address(permit2), type(uint256).max);
+        MockERC20(Currency.unwrap(c1)).approve(address(permit2), type(uint256).max);
+        permit2.approve(Currency.unwrap(c0), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(Currency.unwrap(c1), address(positionManager), type(uint160).max, type(uint48).max);
+
+        MockERC20(Currency.unwrap(c1)).mint(trialAttacker, 3_000_000_000e18);
+        MockERC20(Currency.unwrap(c0)).mint(trialVictim, 3_000_000_000e18);
+        MockERC20(Currency.unwrap(c1)).mint(trialVictim, 3_000_000_000e18);
+        _approveTrader(c0, c1, trialAttacker);
+        _approveTrader(c0, c1, trialVictim);
+
+        plainKey = PoolKey(c0, c1, 3000, 60, IHooks(address(0)));
+        poolManager.initialize(plainKey, Constants.SQRT_PRICE_1_1);
+        int24 tickLower = TickMath.minUsableTick(plainKey.tickSpacing);
+        int24 tickUpper = TickMath.maxUsableTick(plainKey.tickSpacing);
+        (uint256 amt0, uint256 amt1) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            uint128(poolLiquidity)
+        );
+        positionManager.mint(
+            plainKey, tickLower, tickUpper, uint128(poolLiquidity), amt0 + 1, amt1 + 1, address(this), block.timestamp, Constants.ZERO_BYTES
+        );
+    }
+
+    function _frontRun(PoolKey memory key, address trader, uint256 amount) internal returns (uint256 proceeds, uint256 gasUsed) {
+        uint256 before = MockERC20(Currency.unwrap(key.currency0)).balanceOf(trader);
+        uint256 gasBefore = gasleft();
+        vm.prank(trader);
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amount,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: key,
+            hookData: Constants.ZERO_BYTES,
+            receiver: trader,
+            deadline: block.timestamp + 1
+        });
+        gasUsed = gasBefore - gasleft();
+        proceeds = MockERC20(Currency.unwrap(key.currency0)).balanceOf(trader) - before;
+    }
+
+    function _victimTrade(PoolKey memory key, address trader, uint256 amount) internal {
+        vm.prank(trader);
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amount,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: key,
+            hookData: Constants.ZERO_BYTES,
+            receiver: trader,
+            deadline: block.timestamp + 1
+        });
+    }
+
+    function _backRun(PoolKey memory key, address trader, uint256 amount) internal returns (uint256 gasUsed) {
+        uint256 gasBefore = gasleft();
+        vm.prank(trader);
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amount,
+            amountOutMin: 0,
+            zeroForOne: true,
+            poolKey: key,
+            hookData: Constants.ZERO_BYTES,
+            receiver: trader,
+            deadline: block.timestamp + 1
+        });
+        gasUsed = gasBefore - gasleft();
+    }
+
+    function _runSweepTrial(uint256 tradeSize, uint256 gasPriceWei, uint256 trial, uint256 poolLiquidity) internal {
+        (PoolKey memory plainKey, address trialAttacker, address trialVictim) = _setUpSweepTrial(trial, poolLiquidity);
+
+        uint256 attackerToken1Before = MockERC20(Currency.unwrap(plainKey.currency1)).balanceOf(trialAttacker);
+
+        (uint256 frontRunProceeds, uint256 gasUsedFrontRun) = _frontRun(plainKey, trialAttacker, tradeSize);
+        _victimTrade(plainKey, trialVictim, tradeSize);
+        uint256 gasUsedBackRun = _backRun(plainKey, trialAttacker, frontRunProceeds);
+
+        uint256 attackerToken1After = MockERC20(Currency.unwrap(plainKey.currency1)).balanceOf(trialAttacker);
+        int256 tokenProfit = int256(attackerToken1After) - int256(attackerToken1Before);
+        uint256 totalGas = gasUsedFrontRun + gasUsedBackRun;
+        uint256 gasCostWei = totalGas * gasPriceWei;
+
+        emit log_string("---");
+        emit log_named_uint("trade size (wei of token)", tradeSize);
+        emit log_named_int("attacker token profit (wei of token1)", tokenProfit);
+        emit log_named_uint("gas used (both attacker txns)", totalGas);
+        emit log_named_uint("real gas cost (wei of ETH, at Unichain Sepolia's observed price)", gasCostWei);
     }
 }

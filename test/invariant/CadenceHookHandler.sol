@@ -18,6 +18,9 @@ contract CadenceHookHandler is Test {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
+    // Must match the deployed hook's real threshold (set by the invariant test's setUp) -
+    // arbitrary for testing purposes, not a production value. See
+    // script/00_DeployHook.s.sol for the calibrated one.
     uint256 public constant BATCH_THRESHOLD = 5e18;
 
     IPoolManager public immutable poolManager;

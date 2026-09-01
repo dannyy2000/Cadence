@@ -28,6 +28,8 @@ contract CadenceHookInvariantTest is BaseTest {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
 
+    // Arbitrary, for exercising both code paths - not a production value. See
+    // script/00_DeployHook.s.sol for the calibrated one.
     uint256 constant BATCH_THRESHOLD = 5e18;
     uint256 constant BATCH_WINDOW_BLOCKS = 10;
     uint256 constant MAX_BATCH_SIZE = 20;
