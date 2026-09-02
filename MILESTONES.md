@@ -87,6 +87,28 @@ pick up the calibrated `batchThreshold` (see the Fix 1 entry below) — a fresh 
 fresh CREATE2 address, so this table (and `frontend/.env.local`) needed updating rather than
 being changeable in place.
 
+### Demo-recording instance (not the canonical deployment above)
+
+| Contract | Address |
+|---|---|
+| `CadenceHook` (demo) | `0x472859884dE0CC5991D9CFfbc1Fb9FDd7B678088` |
+
+Deployed via `script/99_DeployDemoInstance.s.sol`, reusing the same CTA/CTB currencies and
+the same calibrated `batchThreshold`/`maxBatchSize` as the deployment above — the *only*
+difference is `batchWindowBlocks = 60` instead of `10`. Exists solely because the production
+window (~8-10 real seconds on Unichain Sepolia's ~1s block time) is too tight for a human to
+reliably click through two separate wallet-confirmed trades on camera for the demo recording,
+even with every approval already in place — the mechanism itself doesn't need a human to be
+fast, only this specific recorded moment does. Verified working, not just deployed: its
+`batchThreshold`/`batchWindowBlocks`/`maxBatchSize` were read back on-chain and confirmed
+correct, and a real instant (below-threshold) swap against it succeeded
+(`0x4a033d7d8cd131e193e9356b33cee4f6d2a06aed96c747f2155362931cb4686b`), confirming the pool
+has genuine liquidity, not just a deployed-but-empty hook. Use it locally for recording by
+pointing `frontend/.env.local` at it temporarily (`cp .env.demo .env.local`, then
+`npm run dev`; restore afterward with `cp .env.production .env.local` — both ready-made
+files live in `frontend/`) — the publicly hosted site keeps pointing at the real, canonical
+deployment above and is untouched by any of this.
+
 Unichain Sepolia already has canonical `PoolManager`/`PositionManager`/`SwapRouter`
 deployments (resolved automatically via `hookmate`'s `AddressConstants`) — the local deploy
 sequence's step 2 (`00_DeployV4.s.sol`) isn't needed here. To reproduce: fund a deployer
