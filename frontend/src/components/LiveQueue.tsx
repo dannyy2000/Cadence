@@ -1,6 +1,58 @@
 import { config } from '../config'
-import { usePoolState, useTokenInfo, formatAmount, truncateAddress, type PoolState } from '../hooks/usePoolState'
+import {
+  usePoolState,
+  useRecentSettlements,
+  useTokenInfo,
+  formatAmount,
+  truncateAddress,
+  type PoolState,
+  type SettlementRecord,
+  type TokenInfo,
+} from '../hooks/usePoolState'
 import { TradeForm } from './TradeForm'
+
+const EXPLORER_TX_URL = 'https://sepolia.uniscan.xyz/tx/'
+
+function SettlementCard({
+  settlement,
+  token0,
+  token1,
+}: {
+  settlement: SettlementRecord
+  token0: TokenInfo | null
+  token1: TokenInfo | null
+}) {
+  return (
+    <div className="settlement-card">
+      <div className="settlement-card-head">
+        <span className="settlement-card-badge">✅ Batch settled</span>
+        <span className="hint">block {settlement.blockNumber.toString()}</span>
+      </div>
+      <ul className="settlement-card-orders">
+        {settlement.orders.map((order, i) => (
+          <li key={i} className={order.skipped ? 'settlement-order-skipped' : ''}>
+            <span className="mono">{truncateAddress(order.trader)}</span>
+            <span>
+              {order.zeroForOne
+                ? `${token0?.symbol ?? 'token0'} → ${token1?.symbol ?? 'token1'}`
+                : `${token1?.symbol ?? 'token1'} → ${token0?.symbol ?? 'token0'}`}
+            </span>
+            <span>{formatAmount(order.amountIn, order.zeroForOne ? token0 : token1)}</span>
+            <span className="hint">{order.skipped ? 'skipped (refunded)' : `step ${order.settlementStep}`}</span>
+          </li>
+        ))}
+      </ul>
+      <a
+        className="settlement-card-link"
+        href={`${EXPLORER_TX_URL}${settlement.transactionHash}`}
+        target="_blank"
+        rel="noreferrer"
+      >
+        View this settlement on the block explorer ↗
+      </a>
+    </div>
+  )
+}
 
 function BatchStatus({ state }: { state: PoolState }) {
   if (state.queueLength === 0n) {
@@ -21,6 +73,7 @@ export function LiveQueue() {
   const { state, error } = usePoolState()
   const token0 = useTokenInfo(config.currency0)
   const token1 = useTokenInfo(config.currency1)
+  const settlements = useRecentSettlements()
 
   return (
     <section id="live-queue">
@@ -126,6 +179,27 @@ export function LiveQueue() {
                         ))}
                       </tbody>
                     </table>
+                  )}
+                </div>
+
+                <div className="panel">
+                  <h3>Recent settlements</h3>
+                  {settlements.length === 0 ? (
+                    <p className="hint">
+                      No recent settlements yet — once a batch clears, real proof of it shows up here, not just a
+                      number quietly going back to zero.
+                    </p>
+                  ) : (
+                    <div className="settlement-list">
+                      {settlements.map((settlement) => (
+                        <SettlementCard
+                          key={settlement.transactionHash}
+                          settlement={settlement}
+                          token0={token0}
+                          token1={token1}
+                        />
+                      ))}
+                    </div>
                   )}
                 </div>
               </div>

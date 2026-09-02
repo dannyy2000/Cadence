@@ -1,4 +1,48 @@
 export const cadenceHookAbi = [
+  // Events - the only proof, other than polling state, that a settlement genuinely
+  // happened. Mirrors CadenceHook.sol's event signatures exactly.
+  {
+    type: 'event',
+    name: 'OrderQueued',
+    inputs: [
+      { name: 'poolId', type: 'bytes32', indexed: true },
+      { name: 'trader', type: 'address', indexed: true },
+      { name: 'zeroForOne', type: 'bool', indexed: false },
+      { name: 'amountIn', type: 'uint256', indexed: false },
+      { name: 'queuePosition', type: 'uint256', indexed: false },
+      { name: 'deadline', type: 'uint256', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'OrderSettled',
+    inputs: [
+      { name: 'poolId', type: 'bytes32', indexed: true },
+      { name: 'trader', type: 'address', indexed: true },
+      { name: 'zeroForOne', type: 'bool', indexed: false },
+      { name: 'amountIn', type: 'uint256', indexed: false },
+      { name: 'settlementStep', type: 'uint256', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'OrderSkipped',
+    inputs: [
+      { name: 'poolId', type: 'bytes32', indexed: true },
+      { name: 'trader', type: 'address', indexed: true },
+      { name: 'zeroForOne', type: 'bool', indexed: false },
+      { name: 'amountIn', type: 'uint256', indexed: false },
+      { name: 'settlementStep', type: 'uint256', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'BatchSettled',
+    inputs: [
+      { name: 'poolId', type: 'bytes32', indexed: true },
+      { name: 'ordersSettled', type: 'uint256', indexed: false },
+    ],
+  },
   {
     type: 'function',
     name: 'queueLength',
