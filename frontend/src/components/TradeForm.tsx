@@ -17,7 +17,7 @@ const poolKey = {
 const MINT_AMOUNT = parseUnits('1000', 18)
 const MAX_UINT160 = (1n << 160n) - 1n
 
-type Step = 'idle' | 'minting' | 'approving-token' | 'approving-permit2' | 'swapping' | 'done' | 'error'
+type Step = 'idle' | 'minting' | 'approving-token' | 'approving-permit2' | 'approving-router' | 'swapping' | 'done' | 'error'
 
 export function TradeForm() {
   const { address, isCorrectChain, walletClient } = useWallet()
@@ -137,6 +137,34 @@ export function TradeForm() {
           // Max amount (standard practice) rather than the exact trade size, so this
           // approval covers future trades too instead of needing one per trade.
           args: [sellCurrency, config.routerAddress, MAX_UINT160, nowSeconds + oneDay],
+        })
+        await publicClient.waitForTransactionReceipt({ hash })
+      }
+
+      // Step 2b: direct ERC20 -> router allowance. Confirmed by tracing a real failed
+      // transaction, not assumed: this deployed router settles the batched-trade input by
+      // calling the raw token's transferFrom(trader, poolManager, amount) directly - as
+      // itself, not via Permit2 - so it needs a standard direct allowance from the trader to
+      // the router specifically, on top of (not instead of) the Permit2 steps above. Every
+      // wallet tested before this had one already, left over from earlier CLI-driven testing
+      // under the same address, which is exactly why this was never caught until a genuinely
+      // fresh wallet hit it.
+      const routerAllowance = await publicClient.readContract({
+        address: sellCurrency,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [address, config.routerAddress],
+      })
+      if (routerAllowance < amountWei) {
+        setStep('approving-router')
+        setMessage(`Approving ${sellToken.symbol} for the router…`)
+        const hash = await walletClient.writeContract({
+          account: address,
+          chain: unichainSepolia,
+          address: sellCurrency,
+          abi: erc20Abi,
+          functionName: 'approve',
+          args: [config.routerAddress, maxUint256],
         })
         await publicClient.waitForTransactionReceipt({ hash })
       }
