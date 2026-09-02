@@ -10,7 +10,7 @@
 ![Theme](https://img.shields.io/badge/Theme-Sustainable%20Liquidity%20%26%20MEV%20Protection-FF6B35?style=for-the-badge)
 ![Built For](https://img.shields.io/badge/Built%20for-Uniswap%20v4%20Hooks-FF007A?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Design%20Proposal-F5C518?style=for-the-badge)
-![Research](https://img.shields.io/badge/Research--Backed-9%20Sources%20Cited-2E8B57?style=for-the-badge)
+![Research](https://img.shields.io/badge/Research--Backed-10%20Sources%20Cited-2E8B57?style=for-the-badge)
 
 </div>
 

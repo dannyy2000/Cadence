@@ -738,7 +738,8 @@ section {
   }
 }
 
-.queue-stat-col {
+.queue-stat-col,
+.queue-main-col {
   display: flex;
   flex-direction: column;
   gap: 1.25rem;

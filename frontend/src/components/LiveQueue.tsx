@@ -150,6 +150,7 @@ export function LiveQueue() {
                   </div>
                 </div>
 
+                <div className="queue-main-col">
                 <div className="panel">
                   <h3>Queued orders</h3>
                   {state.orders.length === 0 ? (
@@ -201,6 +202,7 @@ export function LiveQueue() {
                       ))}
                     </div>
                   )}
+                </div>
                 </div>
               </div>
             )}
