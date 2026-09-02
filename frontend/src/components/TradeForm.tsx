@@ -154,6 +154,15 @@ export function TradeForm() {
         address: config.routerAddress,
         abi: swapRouterAbi,
         functionName: 'swapExactTokensForTokens',
+        // A swap through a v4 hook goes through PoolManager's unlock/callback pattern, which
+        // some wallets' automatic gas estimation handles badly - when it can't cleanly
+        // simulate the callback, it falls back to an unreasonably large default instead of a
+        // real number, which public RPCs then reject outright ("gas limit too high") before
+        // the transaction is even attempted. Passing an explicit, real limit sidesteps that
+        // guesswork entirely. 3,000,000 comfortably covers the actual worst case measured in
+        // testing - settling a full 20-order batch as a side effect of this same trade costs
+        // well under 2.9M gas (testGas_SettlementAtMaxBatchSize) - with real headroom to spare.
+        gas: 3_000_000n,
         args: [amountWei, 0n, sellToken0, poolKey, encodeAbiParameters([{ type: 'address' }], [address]), address, deadline],
       })
       await publicClient.waitForTransactionReceipt({ hash })
